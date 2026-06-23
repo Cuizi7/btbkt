@@ -12,7 +12,7 @@ description: Guide agent-friendly Bitbucket Data Center / Server pull request wo
 - Keep credentials out of command text, logs, PR descriptions, and comments. Authentication comes from `BITBUCKET_BASE_URL`, `BITBUCKET_USERNAME`, and `BITBUCKET_TOKEN` or `BITBUCKET_PASSWORD`; never print those values.
 - Prefer compact high-level PR commands. Use raw REST-shaped commands only when the compact command cannot answer the question.
 - Treat all output as JSON. Inspect `counts`, `page`, `pull_request.from`, `pull_request.to`, reviewers, blockers, comments, and truncation fields before concluding.
-- Treat `create`, `comment`, `task`, `reply`, `review`, `approve`, `unapprove`, `needs-work`, `merge`, `decline`, and `reopen` as externally visible mutating commands. Run them only when the user asked for that action or it is the explicit next step in the assigned PR workflow.
+- Treat `create`, `comment`, `task`, `reply`, `reply-many`, `review`, `approve`, `unapprove`, `needs-work`, `merge`, `decline`, and `reopen` as externally visible mutating commands. Run them only when the user asked for that action or it is the explicit next step in the assigned PR workflow.
 
 ## Command Choice
 
@@ -21,10 +21,11 @@ description: Guide agent-friendly Bitbucket Data Center / Server pull request wo
 | Find existing PR for source branch | `btbkt pr current` |
 | Create PR | `btbkt pr create --title TITLE --description TEXT [--reviewer USER]` |
 | Enter, triage, or final-check a PR | `btbkt pr review-summary PR_ID --state OPEN` |
-| Read all review comments from activity stream | `btbkt pr review-comments PR_ID --state OPEN` |
+| Read all review comments from activity stream | `btbkt pr review-comments PR_ID --state OPEN [--with-diff-context 5]` |
 | Only check reviewer state | `btbkt pr review-status PR_ID` |
 | Inspect files and capped diff | `btbkt pr review-context PR_ID [--path PATH] [--max-diff-lines N]` |
-| Reply after fixes | `btbkt pr reply PR_ID COMMENT_ID --text TEXT` |
+| Reply after one fix | `btbkt pr reply PR_ID COMMENT_ID --text TEXT` |
+| Reply after multiple fixes | `btbkt pr reply-many PR_ID --input replies.json --dry-run`, then rerun without `--dry-run` |
 | Submit review decision with context | `btbkt pr review PR_ID --comment TEXT --approve|--needs-work|--unapprove` |
 | List changed files only | `btbkt pr changes PR_ID` |
 | Add a new top-level comment | `btbkt pr comment PR_ID --text TEXT` |
@@ -58,11 +59,13 @@ Notes:
 ## Workflow: Address Review On Your PR
 
 1. Run `btbkt pr review-comments PR_ID --state OPEN`.
-2. Group comments by file and fix code.
-3. Run relevant checks before replying.
-4. Reply to each handled thread with `btbkt pr reply PR_ID COMMENT_ID --text TEXT`; include what changed and which verification passed.
-5. Run `btbkt pr review-summary PR_ID --state OPEN`.
-6. If open comments or blockers remain, report them explicitly instead of saying the PR is clean.
+2. For short or ambiguous comments, rerun with `btbkt pr review-comments PR_ID --state OPEN --with-diff-context 5`, or use `btbkt pr review-context PR_ID --path PATH --max-diff-lines N` when broader file context is needed.
+3. Group comments by file and fix code.
+4. Run relevant checks before replying.
+5. Reply to each handled thread with `btbkt pr reply PR_ID COMMENT_ID --text TEXT`; include what changed and which verification passed.
+6. For multiple handled threads, create `replies.json`, run `btbkt pr reply-many PR_ID --input replies.json --dry-run`, inspect the planned replies, then run the same command without `--dry-run`.
+7. Run `btbkt pr review-summary PR_ID --state OPEN`.
+8. Report `open_comments`, `open_comments_with_replies`, `open_comments_without_replies`, open blockers, source/target commits, and verification. Bitbucket can keep comments `OPEN` after replies, so do not describe replied open comments as unhandled.
 
 ## Pagination And Partial Results
 
@@ -76,6 +79,7 @@ Notes:
 - If `btbkt` reports missing context, pass the missing global flags or run inside a Bitbucket git checkout; do not guess project or repo names.
 - If source branch is missing, pass `--source` to `pr create` or `--source-branch` globally.
 - If target branch is not explicit, `pr create` uses the inferred default branch when available and uses `main` only as the final fallback; pass `--target` or `--target-branch` when the intended base is different.
+- If `btbkt pr reply` returns 404, do not post a top-level fallback comment unless the user explicitly accepts the degraded behavior. A 404 can mean the CLI is using a reply endpoint that is incompatible with the local Bitbucket Server, or that the PR/comment context is wrong.
 - For auth, network, or permission failures, report the failing command, HTTP/status context if present, and the missing access boundary without exposing secrets.
 
 ## Mistakes To Avoid
@@ -83,6 +87,9 @@ Notes:
 - Dumping full PR payloads when `review-summary` is enough.
 - Using path-scoped comment listing to discover all PR comments. Use `review-comments`.
 - Treating local `--state` filtering as global when `page.*.last` is false. Follow pagination.
+- Treating `counts.open_comments` as the number of unhandled comments. Use `open_comments_without_replies` for unreplied open comments, and still preserve the raw open count.
+- Guessing from terse comments such as "提高优先级" without inspecting nearby diff context.
+- Posting a top-level PR comment when the intended action is replying to a review thread.
 - Printing `BITBUCKET_TOKEN`, `BITBUCKET_PASSWORD`, or credentialed remotes.
 - Creating a new PR before checking `btbkt pr current`.
 - Posting approval or needs-work before inspecting `review-summary` and relevant `review-context`.
