@@ -429,6 +429,45 @@ def test_cli_needs_work_maps_to_review_status():
     }
 
 
+def test_cli_reply_posts_parent_comment_payload():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply",
+            "42",
+            "15466",
+            "--text",
+            "Fixed and covered by tests.",
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    method, url, _headers, body = transport.requests[0]
+    assert method == "POST"
+    assert url.endswith("/pull-requests/42/comments")
+    assert json.loads(body.decode("utf-8")) == {
+        "text": "Fixed and covered by tests.",
+        "parent": {"id": 15466},
+    }
+
+
 def test_cli_comments_requires_path_before_calling_bitbucket():
     stdout = io.StringIO()
     stderr = io.StringIO()
