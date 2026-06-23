@@ -479,33 +479,44 @@ def _comment_diff_context(
     if not isinstance(diff, Mapping):
         return {"reason": "missing_diff"}
     if "body" in diff:
-        lines = _flatten_unified_text_diff_lines(diff.get("body"), path)
+        line_groups = _flatten_unified_text_diff_line_groups(diff.get("body"), path)
     else:
-        lines = _flatten_diff_lines(diff, path)
-    if not lines:
+        line_groups = _flatten_diff_line_groups(diff, path)
+    if not line_groups:
         return {"reason": "line_not_found"}
     line_type = _string_or_none(comment.get("line_type"))
-    line_key = _anchor_line_key(line_type)
-    match_index = _find_context_line(lines, line_key=line_key, line=line)
-    if match_index is None and line_key != "destination":
-        match_index = _find_context_line(lines, line_key="destination", line=line)
-    if match_index is None:
+    file_type = _string_or_none(comment.get("file_type"))
+    line_key = _anchor_line_key(line_type, file_type)
+    match_index = None
+    matched_lines = None
+    allow_destination_fallback = not _explicit_anchor_file_side(file_type) and line_key != "destination"
+    for lines in line_groups:
+        match_index = _find_context_line(lines, line_key=line_key, line=line)
+        if match_index is None and allow_destination_fallback:
+            match_index = _find_context_line(lines, line_key="destination", line=line)
+        if match_index is not None:
+            matched_lines = lines
+            break
+    if match_index is None or matched_lines is None:
         return {"reason": "line_not_found"}
     start = max(0, match_index - radius)
-    end = min(len(lines), match_index + radius + 1)
-    return {
-        "path": path,
-        "line": line,
-        "line_type": line_type,
-        "radius": radius,
-        "truncated_before": start > 0,
-        "truncated_after": end < len(lines),
-        "lines": lines[start:end],
-    }
+    end = min(len(matched_lines), match_index + radius + 1)
+    return _clean_dict(
+        {
+            "path": path,
+            "line": line,
+            "line_type": line_type,
+            "file_type": file_type,
+            "radius": radius,
+            "truncated_before": start > 0 or match_index - radius < 0,
+            "truncated_after": end < len(matched_lines) or match_index + radius + 1 > len(matched_lines),
+            "lines": matched_lines[start:end],
+        }
+    )
 
 
-def _flatten_diff_lines(diff: Mapping[str, Any], path: str) -> list[dict[str, Any]]:
-    flattened = []
+def _flatten_diff_line_groups(diff: Mapping[str, Any], path: str) -> list[list[dict[str, Any]]]:
+    groups = []
     for file_diff in _as_list(diff.get("diffs")):
         if not isinstance(file_diff, Mapping):
             continue
@@ -516,6 +527,7 @@ def _flatten_diff_lines(diff: Mapping[str, Any], path: str) -> list[dict[str, An
         for hunk in _as_list(file_diff.get("hunks")):
             if not isinstance(hunk, Mapping):
                 continue
+            flattened = []
             for segment in _as_list(hunk.get("segments")):
                 if not isinstance(segment, Mapping):
                     continue
@@ -533,22 +545,28 @@ def _flatten_diff_lines(diff: Mapping[str, Any], path: str) -> list[dict[str, An
                             }
                         )
                     )
-    return flattened
+            if flattened:
+                groups.append(flattened)
+    return groups
 
 
-def _flatten_unified_text_diff_lines(body: Any, path: str) -> list[dict[str, Any]]:
+def _flatten_unified_text_diff_line_groups(body: Any, path: str) -> list[list[dict[str, Any]]]:
     text = _string_or_none(body) or ""
     sections = _unified_text_sections(text.splitlines())
-    flattened = []
+    groups = []
     for section in sections:
         files = _files_from_unified_lines(section)
         if not any(file.get("path") == path or file.get("src_path") == path for file in files):
             continue
         source_line: Optional[int] = None
         destination_line: Optional[int] = None
+        flattened: list[dict[str, Any]] = []
         for raw_line in section:
             hunk = _parse_unified_hunk_header(raw_line)
             if hunk:
+                if flattened:
+                    groups.append(flattened)
+                    flattened = []
                 source_line, destination_line = hunk
                 continue
             if source_line is None or destination_line is None:
@@ -576,7 +594,9 @@ def _flatten_unified_text_diff_lines(body: Any, path: str) -> list[dict[str, Any
                 )
                 source_line += 1
                 destination_line += 1
-    return flattened
+        if flattened:
+            groups.append(flattened)
+    return groups
 
 
 def _parse_unified_hunk_header(line: str) -> Optional[tuple[int, int]]:
@@ -586,11 +606,23 @@ def _parse_unified_hunk_header(line: str) -> Optional[tuple[int, int]]:
     return int(match.group("source")), int(match.group("destination"))
 
 
-def _anchor_line_key(line_type: Optional[str]) -> str:
+def _anchor_line_key(line_type: Optional[str], file_type: Optional[str] = None) -> str:
+    explicit_side = _explicit_anchor_file_side(file_type)
+    if explicit_side:
+        return explicit_side
     normalized = (line_type or "").upper()
     if normalized in {"REMOVED", "DELETED", "DELETE", "FROM"}:
         return "source"
     return "destination"
+
+
+def _explicit_anchor_file_side(file_type: Optional[str]) -> Optional[str]:
+    normalized = (file_type or "").upper()
+    if normalized == "FROM":
+        return "source"
+    if normalized == "TO":
+        return "destination"
+    return None
 
 
 def _find_context_line(lines: list[dict[str, Any]], *, line_key: str, line: int) -> Optional[int]:
@@ -618,6 +650,7 @@ def _compact_comment(comment: Mapping[str, Any], *, anchor: Any = None) -> dict[
         "path": comment_anchor.get("path") or comment_anchor.get("srcPath"),
         "line": comment_anchor.get("line"),
         "line_type": comment_anchor.get("lineType"),
+        "file_type": comment_anchor.get("fileType"),
         "text": comment.get("text"),
         "replies": replies,
         "reply_count": len(replies),

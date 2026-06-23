@@ -408,6 +408,123 @@ def test_add_diff_context_to_comments_supports_unified_text_diff_body():
     }
 
 
+def test_add_diff_context_to_comments_uses_file_type_from_for_context_anchor():
+    activities = {
+        "values": [
+            {
+                "comment": {
+                    "id": 15466,
+                    "text": "source-side context",
+                    "state": "OPEN",
+                    "author": {"name": "reviewer"},
+                },
+                "commentAnchor": {
+                    "path": "src/app.py",
+                    "line": 20,
+                    "lineType": "CONTEXT",
+                    "fileType": "FROM",
+                },
+            }
+        ]
+    }
+    comments = compact_review_comments(activities)
+    diff_by_path = {
+        "src/app.py": {
+            "diffs": [
+                {
+                    "source": {"toString": "src/app.py"},
+                    "destination": {"toString": "src/app.py"},
+                    "hunks": [
+                        {
+                            "segments": [
+                                {
+                                    "type": "CONTEXT",
+                                    "lines": [
+                                        {"source": 20, "destination": 30, "line": "source-side target"},
+                                        {"source": 21, "destination": 20, "line": "destination collision"},
+                                    ],
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    result = add_diff_context_to_comments(comments, diff_by_path, radius=0)
+
+    comment = result["comments"][0]
+    assert comment["file_type"] == "FROM"
+    assert comment["diff_context"] == {
+        "path": "src/app.py",
+        "line": 20,
+        "line_type": "CONTEXT",
+        "file_type": "FROM",
+        "radius": 0,
+        "truncated_before": False,
+        "truncated_after": True,
+        "lines": [{"type": "CONTEXT", "source": 20, "destination": 30, "text": "source-side target"}],
+    }
+
+
+def test_add_diff_context_to_comments_does_not_cross_hunk_boundaries():
+    comments = {
+        "comments": [
+            {
+                "id": 15466,
+                "path": "src/app.py",
+                "line": 100,
+                "line_type": "ADDED",
+                "text": "target hunk",
+            }
+        ],
+        "count": 1,
+    }
+    diff_by_path = {
+        "src/app.py": {
+            "diffs": [
+                {
+                    "destination": {"toString": "src/app.py"},
+                    "hunks": [
+                        {
+                            "segments": [
+                                {"type": "ADDED", "lines": [{"destination": 10, "line": "unrelated hunk"}]}
+                            ]
+                        },
+                        {
+                            "segments": [
+                                {
+                                    "type": "ADDED",
+                                    "lines": [
+                                        {"destination": 100, "line": "target"},
+                                        {"destination": 101, "line": "same hunk after"},
+                                    ],
+                                }
+                            ]
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+    result = add_diff_context_to_comments(comments, diff_by_path, radius=1)
+
+    assert result["comments"][0]["diff_context"] == {
+        "path": "src/app.py",
+        "line": 100,
+        "line_type": "ADDED",
+        "radius": 1,
+        "truncated_before": True,
+        "truncated_after": False,
+        "lines": [
+            {"type": "ADDED", "destination": 100, "text": "target"},
+            {"type": "ADDED", "destination": 101, "text": "same hunk after"},
+        ],
+    }
+
+
 def test_compact_review_comments_extracts_comment_activities_without_diff_noise():
     activities = {
         "start": 0,
@@ -465,6 +582,7 @@ def test_compact_review_comments_extracts_comment_activities_without_diff_noise(
                 "path": "trading_script_collection/real_trading/real_trading.py",
                 "line": 56,
                 "line_type": "ADDED",
+                "file_type": "TO",
                 "text": "资金账号",
                 "replies": [
                     {

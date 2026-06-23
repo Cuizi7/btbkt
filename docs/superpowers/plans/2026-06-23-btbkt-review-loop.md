@@ -742,6 +742,8 @@ Expected: commit succeeds with only CLI and CLI test changes for this task.
 - Test: `tests/test_compact.py`
 - Test: `tests/test_cli.py`
 
+**Review correction:** Preserve Bitbucket anchor `fileType` as `file_type` and use it before `line_type` when deciding source vs destination line matching. Build context from the matched hunk only; do not flatten an entire file's hunks into one list for radius slicing.
+
 - [ ] **Step 1: Add pure compact diff-context test**
 
 Update the import in `tests/test_compact.py` to include `add_diff_context_to_comments`:

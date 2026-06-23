@@ -97,8 +97,8 @@ The option should:
 - Add a small `diff_context` field only for comments with path/line anchors.
 - Reuse existing diff compaction logic from `compact.py` where practical.
 - Fetch diff data once per relevant path, not once per comment.
-- Treat `5` as a line radius: include up to 5 diff content lines before the anchored line, the anchored line when it can be matched, and up to 5 diff content lines after it. Hunk headers and file headers may be included in addition to those content lines.
-- Match comment anchors against destination lines for added/context comments and source lines for removed comments, using `line_type` when available.
+- Treat `5` as a line radius within the matched diff hunk: include up to 5 diff content lines before the anchored line, the anchored line when it can be matched, and up to 5 diff content lines after it. Do not cross into another hunk to satisfy the radius.
+- Match comment anchors using Bitbucket's `fileType` side when available: `FROM` maps to source lines and `TO` maps to destination lines. Fall back to `lineType` only when `fileType` is absent.
 - Omit `diff_context` and include a concise reason when a comment has no path/line anchor or the hunk cannot be matched.
 
 This is intentionally narrower than full `review-context`. Agents should still use `btbkt pr review-context PR_ID --path PATH --max-diff-lines N` when they need broader file context.
