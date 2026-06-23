@@ -360,11 +360,55 @@ def test_compact_review_comments_extracts_comment_activities_without_diff_noise(
                         "text": "已补充说明",
                     }
                 ],
+                "reply_count": 1,
+                "has_replies": True,
+                "latest_reply_author": "bob",
+                "latest_reply_created": "1970-01-01T00:00:01Z",
             }
         ],
         "count": 1,
         "page": {"start": 0, "limit": 2, "next": 2, "last": False},
     }
+
+
+def test_compact_review_comments_adds_reply_metadata():
+    activities = {
+        "values": [
+            {
+                "comment": {
+                    "id": 15466,
+                    "text": "提高优先级",
+                    "state": "OPEN",
+                    "author": {"name": "reviewer"},
+                    "comments": [
+                        {
+                            "id": 15480,
+                            "text": "已提高优先级，并补了测试。",
+                            "state": "OPEN",
+                            "author": {"name": "alice"},
+                            "createdDate": 1000,
+                        },
+                        {
+                            "id": 15481,
+                            "text": "补充说明验证命令。",
+                            "state": "OPEN",
+                            "author": {"name": "alice"},
+                            "createdDate": 2000,
+                        },
+                    ],
+                },
+                "commentAnchor": {"path": "src/app.py", "line": 8, "lineType": "ADDED"},
+            }
+        ]
+    }
+
+    result = compact_review_comments(activities)
+
+    comment = result["comments"][0]
+    assert comment["reply_count"] == 2
+    assert comment["has_replies"] is True
+    assert comment["latest_reply_author"] == "alice"
+    assert comment["latest_reply_created"] == "1970-01-01T00:00:02Z"
 
 
 def test_compact_review_summary_combines_pr_status_comments_and_blockers():
@@ -473,6 +517,8 @@ def test_compact_review_summary_combines_pr_status_comments_and_blockers():
         "counts": {
             "comments": 1,
             "open_comments": 1,
+            "open_comments_with_replies": 0,
+            "open_comments_without_replies": 1,
             "blockers": 1,
             "open_blockers": 1,
             "review_events": 1,
@@ -490,6 +536,8 @@ def test_compact_review_summary_combines_pr_status_comments_and_blockers():
                 "line": 12,
                 "line_type": "ADDED",
                 "text": "资金账号",
+                "reply_count": 0,
+                "has_replies": False,
             }
         ],
         "blockers": [
@@ -502,6 +550,8 @@ def test_compact_review_summary_combines_pr_status_comments_and_blockers():
                 "line": 3,
                 "line_type": "ADDED",
                 "text": "Add a regression test.",
+                "reply_count": 0,
+                "has_replies": False,
             }
         ],
         "review_events": [
@@ -561,3 +611,44 @@ def test_compact_review_summary_filters_comments_and_blockers_by_state():
     assert result["counts"]["blockers"] == 1
     assert result["comments"][0]["id"] == 2
     assert result["blockers"][0]["id"] == 4
+
+
+def test_compact_review_summary_counts_open_comments_with_and_without_replies():
+    pull_request = {"id": 390, "state": "OPEN", "reviewers": []}
+    activities = {
+        "values": [
+            {
+                "comment": {
+                    "id": 1,
+                    "text": "Already handled.",
+                    "state": "OPEN",
+                    "author": {"name": "reviewer"},
+                    "comments": [{"id": 10, "text": "Fixed.", "author": {"name": "alice"}}],
+                }
+            },
+            {
+                "comment": {
+                    "id": 2,
+                    "text": "Still needs a reply.",
+                    "state": "OPEN",
+                    "author": {"name": "reviewer"},
+                }
+            },
+            {
+                "comment": {
+                    "id": 3,
+                    "text": "Resolved already.",
+                    "state": "RESOLVED",
+                    "author": {"name": "reviewer"},
+                    "comments": [{"id": 11, "text": "Done.", "author": {"name": "alice"}}],
+                }
+            },
+        ],
+    }
+    blocker_comments = {"values": []}
+
+    result = compact_review_summary(pull_request, activities, blocker_comments)
+
+    assert result["counts"]["open_comments"] == 2
+    assert result["counts"]["open_comments_with_replies"] == 1
+    assert result["counts"]["open_comments_without_replies"] == 1

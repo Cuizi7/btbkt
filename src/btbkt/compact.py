@@ -117,6 +117,8 @@ def compact_review_summary(
         "counts": {
             "comments": len(comments),
             "open_comments": _count_state(comments, "OPEN"),
+            "open_comments_with_replies": _count_open_with_replies(comments),
+            "open_comments_without_replies": _count_open_without_replies(comments),
             "blockers": len(blockers),
             "open_blockers": _count_state(blockers, "OPEN"),
             "review_events": len(review_events),
@@ -444,6 +446,7 @@ def _compact_comment(comment: Mapping[str, Any], *, anchor: Any = None) -> dict[
         comment_anchor = {}
     replies = [_compact_reply(reply) for reply in _as_list(comment.get("comments")) if isinstance(reply, Mapping)]
     tasks = [_compact_reply(task) for task in _as_list(comment.get("tasks")) if isinstance(task, Mapping)]
+    latest_reply = _latest_reply(replies)
     result = {
         "id": comment.get("id"),
         "version": comment.get("version"),
@@ -457,9 +460,19 @@ def _compact_comment(comment: Mapping[str, Any], *, anchor: Any = None) -> dict[
         "line_type": comment_anchor.get("lineType"),
         "text": comment.get("text"),
         "replies": replies,
+        "reply_count": len(replies),
+        "has_replies": bool(replies),
+        "latest_reply_author": latest_reply.get("author") if latest_reply else None,
+        "latest_reply_created": latest_reply.get("created") if latest_reply else None,
         "tasks": tasks,
     }
     return _clean_dict(result)
+
+
+def _latest_reply(replies: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not replies:
+        return None
+    return max(replies, key=lambda reply: reply.get("created") or "")
 
 
 def _compact_reply(reply: Mapping[str, Any]) -> dict[str, Any]:
@@ -564,6 +577,14 @@ def _as_list(value: Any) -> list[Any]:
 
 def _count_state(items: list[dict[str, Any]], state: str) -> int:
     return sum(1 for item in items if item.get("state") == state)
+
+
+def _count_open_with_replies(comments: list[dict[str, Any]]) -> int:
+    return sum(1 for comment in comments if comment.get("state") == "OPEN" and comment.get("has_replies") is True)
+
+
+def _count_open_without_replies(comments: list[dict[str, Any]]) -> int:
+    return sum(1 for comment in comments if comment.get("state") == "OPEN" and comment.get("has_replies") is not True)
 
 
 def _count_status(items: list[dict[str, Any]], status: str) -> int:

@@ -525,6 +525,8 @@ def test_cli_review_comments_prints_compact_comments_from_activities():
                 "line": 8,
                 "line_type": "ADDED",
                 "text": "Please add a test.",
+                "reply_count": 0,
+                "has_replies": False,
             }
         ],
         "count": 1,
@@ -580,6 +582,8 @@ def test_cli_review_summary_combines_status_comments_and_blockers():
     assert output["counts"] == {
         "comments": 1,
         "open_comments": 1,
+        "open_comments_with_replies": 0,
+        "open_comments_without_replies": 1,
         "blockers": 0,
         "open_blockers": 0,
         "review_events": 0,
