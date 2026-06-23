@@ -191,3 +191,24 @@ def test_review_comment_without_status_posts_a_normal_comment():
     assert comment_request[0] == "POST"
     assert comment_request[1].endswith("/pull-requests/12/comments")
     assert json.loads(comment_request[3].decode("utf-8")) == {"text": "Please check this."}
+
+
+def test_reply_to_comment_posts_parent_comment_payload():
+    transport = CapturingTransport()
+    client = BitbucketClient(
+        base_url="https://bitbucket.internal",
+        auth_header=("Authorization", "Basic token"),
+        project="ABC",
+        repo="demo",
+        transport=transport,
+    )
+
+    client.reply_to_comment(12, 15466, text="Fixed and covered by tests.")
+
+    method, url, _headers, body = transport.requests[0]
+    assert method == "POST"
+    assert url == "https://bitbucket.internal/rest/api/1.0/projects/ABC/repos/demo/pull-requests/12/comments"
+    assert json.loads(body.decode("utf-8")) == {
+        "text": "Fixed and covered by tests.",
+        "parent": {"id": 15466},
+    }

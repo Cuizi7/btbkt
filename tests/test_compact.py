@@ -1,6 +1,12 @@
 import pytest
 
-from btbkt.compact import compact_current_pull_requests, compact_review_comments, compact_review_context, compact_review_summary
+from btbkt.compact import (
+    add_diff_context_to_comments,
+    compact_current_pull_requests,
+    compact_review_comments,
+    compact_review_context,
+    compact_review_summary,
+)
 
 
 def test_compact_current_pull_requests_filters_by_source_branch():
@@ -293,6 +299,232 @@ def test_compact_review_context_rejects_structured_format_for_raw_text_diff():
         )
 
 
+def test_add_diff_context_to_comments_attaches_radius_around_anchor():
+    comments = {
+        "comments": [
+            {
+                "id": 15466,
+                "path": "src/app.py",
+                "line": 8,
+                "line_type": "ADDED",
+                "text": "提高优先级",
+            }
+        ],
+        "count": 1,
+    }
+    diff_by_path = {
+        "src/app.py": {
+            "diffs": [
+                {
+                    "destination": {"toString": "src/app.py"},
+                    "hunks": [
+                        {
+                            "segments": [
+                                {
+                                    "type": "CONTEXT",
+                                    "lines": [{"source": 7, "destination": 7, "line": "before"}],
+                                },
+                                {
+                                    "type": "ADDED",
+                                    "lines": [
+                                        {"destination": 8, "line": "target"},
+                                        {"destination": 9, "line": "after"},
+                                    ],
+                                },
+                            ]
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    result = add_diff_context_to_comments(comments, diff_by_path, radius=1)
+
+    assert result["comments"][0]["diff_context"] == {
+        "path": "src/app.py",
+        "line": 8,
+        "line_type": "ADDED",
+        "radius": 1,
+        "truncated_before": False,
+        "truncated_after": False,
+        "lines": [
+            {"type": "CONTEXT", "source": 7, "destination": 7, "text": "before"},
+            {"type": "ADDED", "destination": 8, "text": "target"},
+            {"type": "ADDED", "destination": 9, "text": "after"},
+        ],
+    }
+
+
+def test_add_diff_context_to_comments_marks_missing_anchor():
+    comments = {"comments": [{"id": 15466, "text": "提高优先级"}], "count": 1}
+
+    result = add_diff_context_to_comments(comments, {}, radius=1)
+
+    assert result["comments"][0]["diff_context_unavailable"] == "missing_anchor"
+
+
+def test_add_diff_context_to_comments_supports_unified_text_diff_body():
+    comments = {
+        "comments": [
+            {
+                "id": 15466,
+                "path": "src/app.py",
+                "line": 8,
+                "line_type": "ADDED",
+                "text": "提高优先级",
+            }
+        ],
+        "count": 1,
+    }
+    diff_by_path = {
+        "src/app.py": {
+            "body": (
+                "diff --git a/src/app.py b/src/app.py\n"
+                "--- a/src/app.py\n"
+                "+++ b/src/app.py\n"
+                "@@ -7,2 +7,3 @@\n"
+                " before\n"
+                "+target\n"
+                " after\n"
+            )
+        }
+    }
+
+    result = add_diff_context_to_comments(comments, diff_by_path, radius=1)
+
+    assert result["comments"][0]["diff_context"] == {
+        "path": "src/app.py",
+        "line": 8,
+        "line_type": "ADDED",
+        "radius": 1,
+        "truncated_before": False,
+        "truncated_after": False,
+        "lines": [
+            {"type": "CONTEXT", "source": 7, "destination": 7, "text": "before"},
+            {"type": "ADDED", "destination": 8, "text": "target"},
+            {"type": "CONTEXT", "source": 8, "destination": 9, "text": "after"},
+        ],
+    }
+
+
+def test_add_diff_context_to_comments_uses_file_type_from_for_context_anchor():
+    activities = {
+        "values": [
+            {
+                "comment": {
+                    "id": 15466,
+                    "text": "source-side context",
+                    "state": "OPEN",
+                    "author": {"name": "reviewer"},
+                },
+                "commentAnchor": {
+                    "path": "src/app.py",
+                    "line": 20,
+                    "lineType": "CONTEXT",
+                    "fileType": "FROM",
+                },
+            }
+        ]
+    }
+    comments = compact_review_comments(activities)
+    diff_by_path = {
+        "src/app.py": {
+            "diffs": [
+                {
+                    "source": {"toString": "src/app.py"},
+                    "destination": {"toString": "src/app.py"},
+                    "hunks": [
+                        {
+                            "segments": [
+                                {
+                                    "type": "CONTEXT",
+                                    "lines": [
+                                        {"source": 20, "destination": 30, "line": "source-side target"},
+                                        {"source": 21, "destination": 20, "line": "destination collision"},
+                                    ],
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    result = add_diff_context_to_comments(comments, diff_by_path, radius=0)
+
+    comment = result["comments"][0]
+    assert comment["file_type"] == "FROM"
+    assert comment["diff_context"] == {
+        "path": "src/app.py",
+        "line": 20,
+        "line_type": "CONTEXT",
+        "file_type": "FROM",
+        "radius": 0,
+        "truncated_before": False,
+        "truncated_after": True,
+        "lines": [{"type": "CONTEXT", "source": 20, "destination": 30, "text": "source-side target"}],
+    }
+
+
+def test_add_diff_context_to_comments_does_not_cross_hunk_boundaries():
+    comments = {
+        "comments": [
+            {
+                "id": 15466,
+                "path": "src/app.py",
+                "line": 100,
+                "line_type": "ADDED",
+                "text": "target hunk",
+            }
+        ],
+        "count": 1,
+    }
+    diff_by_path = {
+        "src/app.py": {
+            "diffs": [
+                {
+                    "destination": {"toString": "src/app.py"},
+                    "hunks": [
+                        {
+                            "segments": [
+                                {"type": "ADDED", "lines": [{"destination": 10, "line": "unrelated hunk"}]}
+                            ]
+                        },
+                        {
+                            "segments": [
+                                {
+                                    "type": "ADDED",
+                                    "lines": [
+                                        {"destination": 100, "line": "target"},
+                                        {"destination": 101, "line": "same hunk after"},
+                                    ],
+                                }
+                            ]
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+    result = add_diff_context_to_comments(comments, diff_by_path, radius=1)
+
+    assert result["comments"][0]["diff_context"] == {
+        "path": "src/app.py",
+        "line": 100,
+        "line_type": "ADDED",
+        "radius": 1,
+        "truncated_before": True,
+        "truncated_after": False,
+        "lines": [
+            {"type": "ADDED", "destination": 100, "text": "target"},
+            {"type": "ADDED", "destination": 101, "text": "same hunk after"},
+        ],
+    }
+
+
 def test_compact_review_comments_extracts_comment_activities_without_diff_noise():
     activities = {
         "start": 0,
@@ -350,6 +582,7 @@ def test_compact_review_comments_extracts_comment_activities_without_diff_noise(
                 "path": "trading_script_collection/real_trading/real_trading.py",
                 "line": 56,
                 "line_type": "ADDED",
+                "file_type": "TO",
                 "text": "资金账号",
                 "replies": [
                     {
@@ -360,11 +593,55 @@ def test_compact_review_comments_extracts_comment_activities_without_diff_noise(
                         "text": "已补充说明",
                     }
                 ],
+                "reply_count": 1,
+                "has_replies": True,
+                "latest_reply_author": "bob",
+                "latest_reply_created": "1970-01-01T00:00:01Z",
             }
         ],
         "count": 1,
         "page": {"start": 0, "limit": 2, "next": 2, "last": False},
     }
+
+
+def test_compact_review_comments_adds_reply_metadata():
+    activities = {
+        "values": [
+            {
+                "comment": {
+                    "id": 15466,
+                    "text": "提高优先级",
+                    "state": "OPEN",
+                    "author": {"name": "reviewer"},
+                    "comments": [
+                        {
+                            "id": 15480,
+                            "text": "已提高优先级，并补了测试。",
+                            "state": "OPEN",
+                            "author": {"name": "alice"},
+                            "createdDate": 1000,
+                        },
+                        {
+                            "id": 15481,
+                            "text": "补充说明验证命令。",
+                            "state": "OPEN",
+                            "author": {"name": "alice"},
+                            "createdDate": 2000,
+                        },
+                    ],
+                },
+                "commentAnchor": {"path": "src/app.py", "line": 8, "lineType": "ADDED"},
+            }
+        ]
+    }
+
+    result = compact_review_comments(activities)
+
+    comment = result["comments"][0]
+    assert comment["reply_count"] == 2
+    assert comment["has_replies"] is True
+    assert comment["latest_reply_author"] == "alice"
+    assert comment["latest_reply_created"] == "1970-01-01T00:00:02Z"
 
 
 def test_compact_review_summary_combines_pr_status_comments_and_blockers():
@@ -473,6 +750,8 @@ def test_compact_review_summary_combines_pr_status_comments_and_blockers():
         "counts": {
             "comments": 1,
             "open_comments": 1,
+            "open_comments_with_replies": 0,
+            "open_comments_without_replies": 1,
             "blockers": 1,
             "open_blockers": 1,
             "review_events": 1,
@@ -490,6 +769,8 @@ def test_compact_review_summary_combines_pr_status_comments_and_blockers():
                 "line": 12,
                 "line_type": "ADDED",
                 "text": "资金账号",
+                "reply_count": 0,
+                "has_replies": False,
             }
         ],
         "blockers": [
@@ -502,6 +783,8 @@ def test_compact_review_summary_combines_pr_status_comments_and_blockers():
                 "line": 3,
                 "line_type": "ADDED",
                 "text": "Add a regression test.",
+                "reply_count": 0,
+                "has_replies": False,
             }
         ],
         "review_events": [
@@ -561,3 +844,44 @@ def test_compact_review_summary_filters_comments_and_blockers_by_state():
     assert result["counts"]["blockers"] == 1
     assert result["comments"][0]["id"] == 2
     assert result["blockers"][0]["id"] == 4
+
+
+def test_compact_review_summary_counts_open_comments_with_and_without_replies():
+    pull_request = {"id": 390, "state": "OPEN", "reviewers": []}
+    activities = {
+        "values": [
+            {
+                "comment": {
+                    "id": 1,
+                    "text": "Already handled.",
+                    "state": "OPEN",
+                    "author": {"name": "reviewer"},
+                    "comments": [{"id": 10, "text": "Fixed.", "author": {"name": "alice"}}],
+                }
+            },
+            {
+                "comment": {
+                    "id": 2,
+                    "text": "Still needs a reply.",
+                    "state": "OPEN",
+                    "author": {"name": "reviewer"},
+                }
+            },
+            {
+                "comment": {
+                    "id": 3,
+                    "text": "Resolved already.",
+                    "state": "RESOLVED",
+                    "author": {"name": "reviewer"},
+                    "comments": [{"id": 11, "text": "Done.", "author": {"name": "alice"}}],
+                }
+            },
+        ],
+    }
+    blocker_comments = {"values": []}
+
+    result = compact_review_summary(pull_request, activities, blocker_comments)
+
+    assert result["counts"]["open_comments"] == 2
+    assert result["counts"]["open_comments_with_replies"] == 1
+    assert result["counts"]["open_comments_without_replies"] == 1

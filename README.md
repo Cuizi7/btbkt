@@ -69,12 +69,24 @@ btbkt pr review-summary 390
 btbkt pr review-context 390 --path src/app.py --max-diff-lines 120
 ```
 
-Read unresolved review comments and reply after fixing:
+Read unresolved review comments, inspect terse comments with nearby diff context,
+and reply after fixing:
 
 ```bash
-btbkt pr review-comments 390 --state OPEN
+btbkt pr review-comments 390 --state OPEN --with-diff-context 5
 btbkt pr reply 390 15450 --text "Fixed and covered by tests."
 ```
+
+Reply to multiple handled comments from a reviewed JSON file:
+
+```bash
+btbkt pr reply-many 390 --input replies.json --dry-run
+btbkt pr reply-many 390 --input replies.json
+```
+
+`review-summary` reports Bitbucket open state separately from reply state. A
+comment can remain `OPEN` after a reply, so use
+`open_comments_without_replies` for the remaining-unreplied count.
 
 Submit a review decision:
 

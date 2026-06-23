@@ -162,8 +162,8 @@ class BitbucketClient:
     def reply_to_comment(self, pr_id: int, comment_id: int, *, text: str) -> Any:
         return self._request(
             "POST",
-            self._repo_path("pull-requests", str(pr_id), "comments", str(comment_id), "replies"),
-            json_body={"text": text},
+            self._repo_path("pull-requests", str(pr_id), "comments"),
+            json_body={"text": text, "parent": {"id": comment_id}},
         )
 
     def approve_pull_request(self, pr_id: int) -> Any:

@@ -1,6 +1,7 @@
 import io
 import json
 
+from btbkt.client import BitbucketAPIError
 from btbkt.cli import main
 
 
@@ -11,6 +12,18 @@ class CapturingTransport:
     def __call__(self, method, url, headers, body):
         self.requests.append((method, url, headers, body))
         return {"url": url, "method": method}
+
+
+class FailingReplyTransport:
+    def __init__(self):
+        self.requests = []
+
+    def __call__(self, method, url, headers, body):
+        self.requests.append((method, url, headers, body))
+        payload = json.loads(body.decode("utf-8")) if body else {}
+        if payload.get("parent", {}).get("id") == 15466:
+            raise BitbucketAPIError(404, url, "missing reply endpoint")
+        return {"ok": True, "method": method}
 
 
 class ReviewTransport:
@@ -288,6 +301,64 @@ class ReviewContextTransport:
         raise AssertionError(f"Unexpected URL: {url}")
 
 
+class ReviewCommentsContextTransport:
+    def __init__(self):
+        self.requests = []
+
+    def __call__(self, method, url, headers, body):
+        self.requests.append((method, url, headers, body))
+        if url.endswith("/pull-requests/42/activities?limit=100"):
+            return {
+                "start": 0,
+                "limit": 100,
+                "isLastPage": True,
+                "values": [
+                    {
+                        "action": "COMMENTED",
+                        "comment": {
+                            "id": 15466,
+                            "text": "提高优先级",
+                            "state": "OPEN",
+                            "author": {"name": "reviewer"},
+                        },
+                        "commentAnchor": {"path": "src/app.py", "line": 8, "lineType": "ADDED"},
+                    },
+                    {
+                        "action": "COMMENTED",
+                        "comment": {
+                            "id": 15467,
+                            "text": "没有锚点",
+                            "state": "OPEN",
+                            "author": {"name": "reviewer"},
+                        },
+                    },
+                ],
+            }
+        if url.endswith("/pull-requests/42/diff?path=src%2Fapp.py"):
+            return {
+                "diffs": [
+                    {
+                        "destination": {"toString": "src/app.py"},
+                        "hunks": [
+                            {
+                                "segments": [
+                                    {
+                                        "type": "CONTEXT",
+                                        "lines": [{"source": 7, "destination": 7, "line": "before"}],
+                                    },
+                                    {
+                                        "type": "ADDED",
+                                        "lines": [{"destination": 8, "line": "target"}],
+                                    },
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            }
+        raise AssertionError(f"Unexpected URL: {url}")
+
+
 class TruncatedUnifiedReviewContextTransport:
     def __init__(self):
         self.requests = []
@@ -429,6 +500,275 @@ def test_cli_needs_work_maps_to_review_status():
     }
 
 
+def test_cli_reply_posts_parent_comment_payload():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply",
+            "42",
+            "15466",
+            "--text",
+            "Fixed and covered by tests.",
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    method, url, _headers, body = transport.requests[0]
+    assert method == "POST"
+    assert url.endswith("/pull-requests/42/comments")
+    assert json.loads(body.decode("utf-8")) == {
+        "text": "Fixed and covered by tests.",
+        "parent": {"id": 15466},
+    }
+
+
+def test_cli_reply_many_dry_run_validates_input_without_requests(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(
+        json.dumps(
+            [
+                {"comment_id": 15466, "text": "Fixed first comment."},
+                {"comment_id": 15467, "text": "Fixed second comment."},
+            ]
+        )
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+            "--dry-run",
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    assert transport.requests == []
+    assert json.loads(stdout.getvalue()) == {
+        "dry_run": True,
+        "count": 2,
+        "replies": [
+            {"comment_id": 15466, "text": "Fixed first comment."},
+            {"comment_id": 15467, "text": "Fixed second comment."},
+        ],
+    }
+
+
+def test_cli_reply_many_rejects_unknown_fields_before_requests(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(json.dumps([{"comment_id": 15466, "body": "wrong key"}]))
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert transport.requests == []
+    error = json.loads(stderr.getvalue())
+    assert error["error"] == "ValueError"
+    assert "unknown fields" in error["message"]
+
+
+def test_cli_reply_many_posts_replies_sequentially(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(
+        json.dumps(
+            [
+                {"comment_id": 15466, "text": "Fixed first comment."},
+                {"comment_id": 15467, "text": "Fixed second comment."},
+            ]
+        )
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    assert [request[0] for request in transport.requests] == ["POST", "POST"]
+    assert [json.loads(request[3].decode("utf-8")) for request in transport.requests] == [
+        {"text": "Fixed first comment.", "parent": {"id": 15466}},
+        {"text": "Fixed second comment.", "parent": {"id": 15467}},
+    ]
+    output = json.loads(stdout.getvalue())
+    assert output["count"] == 2
+    assert output["attempted"] == 2
+    assert output["failed"] == 0
+    assert [result["status"] for result in output["results"]] == ["ok", "ok"]
+
+
+def test_cli_reply_many_stops_on_first_api_error_by_default(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(
+        json.dumps(
+            [
+                {"comment_id": 15466, "text": "Fails first."},
+                {"comment_id": 15467, "text": "Should not be attempted."},
+            ]
+        )
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = FailingReplyTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stderr.getvalue() == ""
+    assert len(transport.requests) == 1
+    output = json.loads(stdout.getvalue())
+    assert output["attempted"] == 1
+    assert output["failed"] == 1
+    assert output["results"][0]["comment_id"] == 15466
+    assert output["results"][0]["status"] == "error"
+    assert output["results"][0]["error"]["status"] == 404
+
+
+def test_cli_reply_many_continue_on_error_attempts_remaining_replies(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(
+        json.dumps(
+            [
+                {"comment_id": 15466, "text": "Fails first."},
+                {"comment_id": 15467, "text": "Still attempt this."},
+            ]
+        )
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = FailingReplyTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+            "--continue-on-error",
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stderr.getvalue() == ""
+    assert len(transport.requests) == 2
+    output = json.loads(stdout.getvalue())
+    assert output["attempted"] == 2
+    assert output["failed"] == 1
+    assert [result["status"] for result in output["results"]] == ["error", "ok"]
+
+
 def test_cli_comments_requires_path_before_calling_bitbucket():
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -486,6 +826,8 @@ def test_cli_review_comments_prints_compact_comments_from_activities():
                 "line": 8,
                 "line_type": "ADDED",
                 "text": "Please add a test.",
+                "reply_count": 0,
+                "has_replies": False,
             }
         ],
         "count": 1,
@@ -516,6 +858,49 @@ def test_cli_review_comments_filters_state_locally():
     assert output["comments"][0]["state"] == "RESOLVED"
 
 
+def test_cli_review_comments_with_diff_context_fetches_once_per_path():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = ReviewCommentsContextTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "review-comments",
+            "42",
+            "--state",
+            "OPEN",
+            "--with-diff-context",
+            "1",
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    output = json.loads(stdout.getvalue())
+    assert output["comments"][0]["diff_context"]["lines"] == [
+        {"type": "CONTEXT", "source": 7, "destination": 7, "text": "before"},
+        {"type": "ADDED", "destination": 8, "text": "target"},
+    ]
+    assert output["comments"][1]["diff_context_unavailable"] == "missing_anchor"
+    assert [request[1].rsplit("/", 1)[-1] for request in transport.requests] == [
+        "activities?limit=100",
+        "diff?path=src%2Fapp.py",
+    ]
+
+
 def test_cli_review_summary_combines_status_comments_and_blockers():
     stdout = io.StringIO()
     transport = ReviewTransport()
@@ -541,6 +926,8 @@ def test_cli_review_summary_combines_status_comments_and_blockers():
     assert output["counts"] == {
         "comments": 1,
         "open_comments": 1,
+        "open_comments_with_replies": 0,
+        "open_comments_without_replies": 1,
         "blockers": 0,
         "open_blockers": 0,
         "review_events": 0,
