@@ -10,6 +10,7 @@ from typing import Any, Mapping, Optional, Sequence, TextIO, Union
 
 from .client import BitbucketAPIError, BitbucketClient, Transport
 from .compact import (
+    add_diff_context_to_comments,
     compact_current_pull_requests,
     compact_review_comments,
     compact_review_context,
@@ -163,6 +164,11 @@ def build_parser() -> argparse.ArgumentParser:
     review_comments_parser.add_argument("--state", help="Locally filter compact comments by state.")
     review_comments_parser.add_argument("--limit", type=int, default=100)
     review_comments_parser.add_argument("--start", type=int)
+    review_comments_parser.add_argument(
+        "--with-diff-context",
+        type=int,
+        help="Attach bounded diff context around each anchored comment using this line radius.",
+    )
 
     review_status_parser = pr_actions.add_parser("review-status", help="Show compact PR reviewer status.")
     review_status_parser.add_argument("pr_id", type=int)
@@ -332,7 +338,13 @@ def _dispatch_pr(args: argparse.Namespace, context, client: BitbucketClient) -> 
         return client.get_activities(args.pr_id, limit=args.limit, start=args.start)
     if args.action == "review-comments":
         activities = client.get_activities(args.pr_id, limit=args.limit, start=args.start)
-        return compact_review_comments(activities, state=args.state)
+        result = compact_review_comments(activities, state=args.state)
+        if args.with_diff_context is not None:
+            if args.with_diff_context < 0:
+                raise ValueError("--with-diff-context must be zero or positive.")
+            diff_by_path = _diffs_for_comment_paths(client, args.pr_id, result["comments"])
+            result = add_diff_context_to_comments(result, diff_by_path, radius=args.with_diff_context)
+        return result
     if args.action == "review-status":
         return compact_review_status(client.get_pull_request(args.pr_id))
     if args.action == "review-summary":
@@ -474,6 +486,28 @@ def _reply_many(
         "results": results,
     }
     return CommandResult(payload=payload, exit_code=1 if failed else 0)
+
+
+def _diffs_for_comment_paths(
+    client: BitbucketClient,
+    pr_id: int,
+    comments: Sequence[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    paths = sorted(
+        {
+            path
+            for comment in comments
+            if isinstance(comment, Mapping)
+            for path in [_comment_path(comment)]
+            if path
+        }
+    )
+    return {path: client.get_diff(pr_id, path=path) for path in paths}
+
+
+def _comment_path(comment: Mapping[str, Any]) -> Optional[str]:
+    value = comment.get("path")
+    return value if isinstance(value, str) and value else None
 
 
 def _current_pull_requests(args: argparse.Namespace, context, client: BitbucketClient) -> dict[str, Any]:

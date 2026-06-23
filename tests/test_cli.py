@@ -288,6 +288,64 @@ class ReviewContextTransport:
         raise AssertionError(f"Unexpected URL: {url}")
 
 
+class ReviewCommentsContextTransport:
+    def __init__(self):
+        self.requests = []
+
+    def __call__(self, method, url, headers, body):
+        self.requests.append((method, url, headers, body))
+        if url.endswith("/pull-requests/42/activities?limit=100"):
+            return {
+                "start": 0,
+                "limit": 100,
+                "isLastPage": True,
+                "values": [
+                    {
+                        "action": "COMMENTED",
+                        "comment": {
+                            "id": 15466,
+                            "text": "提高优先级",
+                            "state": "OPEN",
+                            "author": {"name": "reviewer"},
+                        },
+                        "commentAnchor": {"path": "src/app.py", "line": 8, "lineType": "ADDED"},
+                    },
+                    {
+                        "action": "COMMENTED",
+                        "comment": {
+                            "id": 15467,
+                            "text": "没有锚点",
+                            "state": "OPEN",
+                            "author": {"name": "reviewer"},
+                        },
+                    },
+                ],
+            }
+        if url.endswith("/pull-requests/42/diff?path=src%2Fapp.py"):
+            return {
+                "diffs": [
+                    {
+                        "destination": {"toString": "src/app.py"},
+                        "hunks": [
+                            {
+                                "segments": [
+                                    {
+                                        "type": "CONTEXT",
+                                        "lines": [{"source": 7, "destination": 7, "line": "before"}],
+                                    },
+                                    {
+                                        "type": "ADDED",
+                                        "lines": [{"destination": 8, "line": "target"}],
+                                    },
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            }
+        raise AssertionError(f"Unexpected URL: {url}")
+
+
 class TruncatedUnifiedReviewContextTransport:
     def __init__(self):
         self.requests = []
@@ -692,6 +750,49 @@ def test_cli_review_comments_filters_state_locally():
     assert output["count"] == 1
     assert output["comments"][0]["id"] == 101
     assert output["comments"][0]["state"] == "RESOLVED"
+
+
+def test_cli_review_comments_with_diff_context_fetches_once_per_path():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = ReviewCommentsContextTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "review-comments",
+            "42",
+            "--state",
+            "OPEN",
+            "--with-diff-context",
+            "1",
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    output = json.loads(stdout.getvalue())
+    assert output["comments"][0]["diff_context"]["lines"] == [
+        {"type": "CONTEXT", "source": 7, "destination": 7, "text": "before"},
+        {"type": "ADDED", "destination": 8, "text": "target"},
+    ]
+    assert output["comments"][1]["diff_context_unavailable"] == "missing_anchor"
+    assert [request[1].rsplit("/", 1)[-1] for request in transport.requests] == [
+        "activities?limit=100",
+        "diff?path=src%2Fapp.py",
+    ]
 
 
 def test_cli_review_summary_combines_status_comments_and_blockers():

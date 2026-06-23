@@ -100,6 +100,30 @@ def compact_review_comments(activities: Mapping[str, Any], *, state: Optional[st
     return {"comments": comments, "count": len(comments), "page": _page_info(activities)}
 
 
+def add_diff_context_to_comments(
+    review_comments: Mapping[str, Any],
+    diff_by_path: Mapping[str, Mapping[str, Any]],
+    *,
+    radius: int,
+) -> dict[str, Any]:
+    if radius < 0:
+        raise ValueError("radius must be non-negative.")
+    result = dict(review_comments)
+    enriched = []
+    for comment in _as_list(review_comments.get("comments")):
+        if not isinstance(comment, Mapping):
+            continue
+        compact = dict(comment)
+        context = _comment_diff_context(compact, diff_by_path, radius=radius)
+        if "lines" in context:
+            compact["diff_context"] = context
+        else:
+            compact["diff_context_unavailable"] = context["reason"]
+        enriched.append(compact)
+    result["comments"] = enriched
+    return result
+
+
 def compact_review_summary(
     pull_request: Mapping[str, Any],
     activities: Mapping[str, Any],
@@ -438,6 +462,90 @@ def _compact_review_events(activities: Mapping[str, Any]) -> list[dict[str, Any]
         )
         events.append(event)
     return events
+
+
+def _comment_diff_context(
+    comment: Mapping[str, Any],
+    diff_by_path: Mapping[str, Mapping[str, Any]],
+    *,
+    radius: int,
+) -> dict[str, Any]:
+    path = _string_or_none(comment.get("path"))
+    line = comment.get("line")
+    if not path or not isinstance(line, int):
+        return {"reason": "missing_anchor"}
+    diff = diff_by_path.get(path)
+    if not isinstance(diff, Mapping):
+        return {"reason": "missing_diff"}
+    if "body" in diff:
+        return {"reason": "unsupported_diff_format"}
+    lines = _flatten_diff_lines(diff, path)
+    if not lines:
+        return {"reason": "line_not_found"}
+    line_type = _string_or_none(comment.get("line_type"))
+    line_key = _anchor_line_key(line_type)
+    match_index = _find_context_line(lines, line_key=line_key, line=line)
+    if match_index is None and line_key != "destination":
+        match_index = _find_context_line(lines, line_key="destination", line=line)
+    if match_index is None:
+        return {"reason": "line_not_found"}
+    start = max(0, match_index - radius)
+    end = min(len(lines), match_index + radius + 1)
+    return {
+        "path": path,
+        "line": line,
+        "line_type": line_type,
+        "radius": radius,
+        "truncated_before": start > 0,
+        "truncated_after": end < len(lines),
+        "lines": lines[start:end],
+    }
+
+
+def _flatten_diff_lines(diff: Mapping[str, Any], path: str) -> list[dict[str, Any]]:
+    flattened = []
+    for file_diff in _as_list(diff.get("diffs")):
+        if not isinstance(file_diff, Mapping):
+            continue
+        destination = _path_text(file_diff.get("destination")) or _path_text(file_diff.get("source"))
+        source = _path_text(file_diff.get("source")) or destination
+        if destination != path and source != path:
+            continue
+        for hunk in _as_list(file_diff.get("hunks")):
+            if not isinstance(hunk, Mapping):
+                continue
+            for segment in _as_list(hunk.get("segments")):
+                if not isinstance(segment, Mapping):
+                    continue
+                segment_type = _string_or_none(segment.get("type")) or "CONTEXT"
+                for line in _as_list(segment.get("lines")):
+                    if not isinstance(line, Mapping):
+                        continue
+                    flattened.append(
+                        _clean_dict(
+                            {
+                                "type": segment_type,
+                                "source": line.get("source"),
+                                "destination": line.get("destination"),
+                                "text": line.get("line") if "line" in line else line.get("text"),
+                            }
+                        )
+                    )
+    return flattened
+
+
+def _anchor_line_key(line_type: Optional[str]) -> str:
+    normalized = (line_type or "").upper()
+    if normalized in {"REMOVED", "DELETED", "DELETE", "FROM"}:
+        return "source"
+    return "destination"
+
+
+def _find_context_line(lines: list[dict[str, Any]], *, line_key: str, line: int) -> Optional[int]:
+    for index, entry in enumerate(lines):
+        if entry.get(line_key) == line:
+            return index
+    return None
 
 
 def _compact_comment(comment: Mapping[str, Any], *, anchor: Any = None) -> dict[str, Any]:

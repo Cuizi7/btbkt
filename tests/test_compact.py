@@ -1,6 +1,12 @@
 import pytest
 
-from btbkt.compact import compact_current_pull_requests, compact_review_comments, compact_review_context, compact_review_summary
+from btbkt.compact import (
+    add_diff_context_to_comments,
+    compact_current_pull_requests,
+    compact_review_comments,
+    compact_review_context,
+    compact_review_summary,
+)
 
 
 def test_compact_current_pull_requests_filters_by_source_branch():
@@ -291,6 +297,71 @@ def test_compact_review_context_rejects_structured_format_for_raw_text_diff():
             {"body": "diff --git a/src/app.py b/src/app.py\n+app\n"},
             diff_format="structured",
         )
+
+
+def test_add_diff_context_to_comments_attaches_radius_around_anchor():
+    comments = {
+        "comments": [
+            {
+                "id": 15466,
+                "path": "src/app.py",
+                "line": 8,
+                "line_type": "ADDED",
+                "text": "提高优先级",
+            }
+        ],
+        "count": 1,
+    }
+    diff_by_path = {
+        "src/app.py": {
+            "diffs": [
+                {
+                    "destination": {"toString": "src/app.py"},
+                    "hunks": [
+                        {
+                            "segments": [
+                                {
+                                    "type": "CONTEXT",
+                                    "lines": [{"source": 7, "destination": 7, "line": "before"}],
+                                },
+                                {
+                                    "type": "ADDED",
+                                    "lines": [
+                                        {"destination": 8, "line": "target"},
+                                        {"destination": 9, "line": "after"},
+                                    ],
+                                },
+                            ]
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    result = add_diff_context_to_comments(comments, diff_by_path, radius=1)
+
+    assert result["comments"][0]["diff_context"] == {
+        "path": "src/app.py",
+        "line": 8,
+        "line_type": "ADDED",
+        "radius": 1,
+        "truncated_before": False,
+        "truncated_after": False,
+        "lines": [
+            {"type": "CONTEXT", "source": 7, "destination": 7, "text": "before"},
+            {"type": "ADDED", "destination": 8, "text": "target"},
+            {"type": "ADDED", "destination": 9, "text": "after"},
+        ],
+    }
+
+
+def test_add_diff_context_to_comments_marks_missing_anchor():
+    comments = {"comments": [{"id": 15466, "text": "提高优先级"}], "count": 1}
+
+    result = add_diff_context_to_comments(comments, {}, radius=1)
+
+    assert result["comments"][0]["diff_context_unavailable"] == "missing_anchor"
 
 
 def test_compact_review_comments_extracts_comment_activities_without_diff_noise():
