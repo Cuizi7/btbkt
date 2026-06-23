@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
@@ -478,8 +479,9 @@ def _comment_diff_context(
     if not isinstance(diff, Mapping):
         return {"reason": "missing_diff"}
     if "body" in diff:
-        return {"reason": "unsupported_diff_format"}
-    lines = _flatten_diff_lines(diff, path)
+        lines = _flatten_unified_text_diff_lines(diff.get("body"), path)
+    else:
+        lines = _flatten_diff_lines(diff, path)
     if not lines:
         return {"reason": "line_not_found"}
     line_type = _string_or_none(comment.get("line_type"))
@@ -532,6 +534,56 @@ def _flatten_diff_lines(diff: Mapping[str, Any], path: str) -> list[dict[str, An
                         )
                     )
     return flattened
+
+
+def _flatten_unified_text_diff_lines(body: Any, path: str) -> list[dict[str, Any]]:
+    text = _string_or_none(body) or ""
+    sections = _unified_text_sections(text.splitlines())
+    flattened = []
+    for section in sections:
+        files = _files_from_unified_lines(section)
+        if not any(file.get("path") == path or file.get("src_path") == path for file in files):
+            continue
+        source_line: Optional[int] = None
+        destination_line: Optional[int] = None
+        for raw_line in section:
+            hunk = _parse_unified_hunk_header(raw_line)
+            if hunk:
+                source_line, destination_line = hunk
+                continue
+            if source_line is None or destination_line is None:
+                continue
+            if raw_line.startswith("\\"):
+                continue
+            if raw_line.startswith("+++") or raw_line.startswith("---"):
+                continue
+            if raw_line.startswith("+"):
+                flattened.append(_clean_dict({"type": "ADDED", "destination": destination_line, "text": raw_line[1:]}))
+                destination_line += 1
+            elif raw_line.startswith("-"):
+                flattened.append(_clean_dict({"type": "REMOVED", "source": source_line, "text": raw_line[1:]}))
+                source_line += 1
+            elif raw_line.startswith(" "):
+                flattened.append(
+                    _clean_dict(
+                        {
+                            "type": "CONTEXT",
+                            "source": source_line,
+                            "destination": destination_line,
+                            "text": raw_line[1:],
+                        }
+                    )
+                )
+                source_line += 1
+                destination_line += 1
+    return flattened
+
+
+def _parse_unified_hunk_header(line: str) -> Optional[tuple[int, int]]:
+    match = re.match(r"^@@ -(?P<source>\d+)(?:,\d+)? \+(?P<destination>\d+)(?:,\d+)? @@", line)
+    if not match:
+        return None
+    return int(match.group("source")), int(match.group("destination"))
 
 
 def _anchor_line_key(line_type: Optional[str]) -> str:

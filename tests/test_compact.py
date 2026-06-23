@@ -364,6 +364,50 @@ def test_add_diff_context_to_comments_marks_missing_anchor():
     assert result["comments"][0]["diff_context_unavailable"] == "missing_anchor"
 
 
+def test_add_diff_context_to_comments_supports_unified_text_diff_body():
+    comments = {
+        "comments": [
+            {
+                "id": 15466,
+                "path": "src/app.py",
+                "line": 8,
+                "line_type": "ADDED",
+                "text": "提高优先级",
+            }
+        ],
+        "count": 1,
+    }
+    diff_by_path = {
+        "src/app.py": {
+            "body": (
+                "diff --git a/src/app.py b/src/app.py\n"
+                "--- a/src/app.py\n"
+                "+++ b/src/app.py\n"
+                "@@ -7,2 +7,3 @@\n"
+                " before\n"
+                "+target\n"
+                " after\n"
+            )
+        }
+    }
+
+    result = add_diff_context_to_comments(comments, diff_by_path, radius=1)
+
+    assert result["comments"][0]["diff_context"] == {
+        "path": "src/app.py",
+        "line": 8,
+        "line_type": "ADDED",
+        "radius": 1,
+        "truncated_before": False,
+        "truncated_after": False,
+        "lines": [
+            {"type": "CONTEXT", "source": 7, "destination": 7, "text": "before"},
+            {"type": "ADDED", "destination": 8, "text": "target"},
+            {"type": "CONTEXT", "source": 8, "destination": 9, "text": "after"},
+        ],
+    }
+
+
 def test_compact_review_comments_extracts_comment_activities_without_diff_noise():
     activities = {
         "start": 0,

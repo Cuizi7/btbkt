@@ -1,6 +1,7 @@
 import io
 import json
 
+from btbkt.client import BitbucketAPIError
 from btbkt.cli import main
 
 
@@ -11,6 +12,18 @@ class CapturingTransport:
     def __call__(self, method, url, headers, body):
         self.requests.append((method, url, headers, body))
         return {"url": url, "method": method}
+
+
+class FailingReplyTransport:
+    def __init__(self):
+        self.requests = []
+
+    def __call__(self, method, url, headers, body):
+        self.requests.append((method, url, headers, body))
+        payload = json.loads(body.decode("utf-8")) if body else {}
+        if payload.get("parent", {}).get("id") == 15466:
+            raise BitbucketAPIError(404, url, "missing reply endpoint")
+        return {"ok": True, "method": method}
 
 
 class ReviewTransport:
@@ -661,6 +674,99 @@ def test_cli_reply_many_posts_replies_sequentially(tmp_path):
     assert output["attempted"] == 2
     assert output["failed"] == 0
     assert [result["status"] for result in output["results"]] == ["ok", "ok"]
+
+
+def test_cli_reply_many_stops_on_first_api_error_by_default(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(
+        json.dumps(
+            [
+                {"comment_id": 15466, "text": "Fails first."},
+                {"comment_id": 15467, "text": "Should not be attempted."},
+            ]
+        )
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = FailingReplyTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stderr.getvalue() == ""
+    assert len(transport.requests) == 1
+    output = json.loads(stdout.getvalue())
+    assert output["attempted"] == 1
+    assert output["failed"] == 1
+    assert output["results"][0]["comment_id"] == 15466
+    assert output["results"][0]["status"] == "error"
+    assert output["results"][0]["error"]["status"] == 404
+
+
+def test_cli_reply_many_continue_on_error_attempts_remaining_replies(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(
+        json.dumps(
+            [
+                {"comment_id": 15466, "text": "Fails first."},
+                {"comment_id": 15467, "text": "Still attempt this."},
+            ]
+        )
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = FailingReplyTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+            "--continue-on-error",
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stderr.getvalue() == ""
+    assert len(transport.requests) == 2
+    output = json.loads(stdout.getvalue())
+    assert output["attempted"] == 2
+    assert output["failed"] == 1
+    assert [result["status"] for result in output["results"]] == ["error", "ok"]
 
 
 def test_cli_comments_requires_path_before_calling_bitbucket():
