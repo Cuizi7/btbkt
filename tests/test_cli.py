@@ -468,6 +468,143 @@ def test_cli_reply_posts_parent_comment_payload():
     }
 
 
+def test_cli_reply_many_dry_run_validates_input_without_requests(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(
+        json.dumps(
+            [
+                {"comment_id": 15466, "text": "Fixed first comment."},
+                {"comment_id": 15467, "text": "Fixed second comment."},
+            ]
+        )
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+            "--dry-run",
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    assert transport.requests == []
+    assert json.loads(stdout.getvalue()) == {
+        "dry_run": True,
+        "count": 2,
+        "replies": [
+            {"comment_id": 15466, "text": "Fixed first comment."},
+            {"comment_id": 15467, "text": "Fixed second comment."},
+        ],
+    }
+
+
+def test_cli_reply_many_rejects_unknown_fields_before_requests(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(json.dumps([{"comment_id": 15466, "body": "wrong key"}]))
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert transport.requests == []
+    error = json.loads(stderr.getvalue())
+    assert error["error"] == "ValueError"
+    assert "unknown fields" in error["message"]
+
+
+def test_cli_reply_many_posts_replies_sequentially(tmp_path):
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(
+        json.dumps(
+            [
+                {"comment_id": 15466, "text": "Fixed first comment."},
+                {"comment_id": 15467, "text": "Fixed second comment."},
+            ]
+        )
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        [
+            "--project",
+            "ABC",
+            "--repo",
+            "demo",
+            "pr",
+            "reply-many",
+            "42",
+            "--input",
+            str(replies_path),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    assert [request[0] for request in transport.requests] == ["POST", "POST"]
+    assert [json.loads(request[3].decode("utf-8")) for request in transport.requests] == [
+        {"text": "Fixed first comment.", "parent": {"id": 15466}},
+        {"text": "Fixed second comment.", "parent": {"id": 15467}},
+    ]
+    output = json.loads(stdout.getvalue())
+    assert output["count"] == 2
+    assert output["attempted"] == 2
+    assert output["failed"] == 0
+    assert [result["status"] for result in output["results"]] == ["ok", "ok"]
+
+
 def test_cli_comments_requires_path_before_calling_bitbucket():
     stdout = io.StringIO()
     stderr = io.StringIO()

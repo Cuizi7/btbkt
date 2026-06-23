@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, TextIO, Union
 
@@ -16,6 +17,12 @@ from .compact import (
     compact_review_summary,
 )
 from .context import ConfigError, read_git_info, resolve_context
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    payload: Any
+    exit_code: int = 0
 
 
 def console() -> None:
@@ -61,6 +68,10 @@ def main(
             transport=transport,
         )
         result = _dispatch(args, context, client)
+        exit_code = 0
+        if isinstance(result, CommandResult):
+            exit_code = result.exit_code
+            result = result.payload
     except ConfigError as exc:
         _write_json(stderr, {"error": "configuration_error", "message": str(exc)})
         return 2
@@ -73,7 +84,7 @@ def main(
         return 1
 
     _write_json(stdout, result)
-    return 0
+    return exit_code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -211,6 +222,16 @@ def build_parser() -> argparse.ArgumentParser:
     reply_parser.add_argument("pr_id", type=int)
     reply_parser.add_argument("comment_id", type=int)
     reply_parser.add_argument("--text", required=True)
+
+    reply_many_parser = pr_actions.add_parser("reply-many", help="Reply to multiple PR comments from a JSON file.")
+    reply_many_parser.add_argument("pr_id", type=int)
+    reply_many_parser.add_argument("--input", required=True, help="JSON file containing reply objects.")
+    reply_many_parser.add_argument("--dry-run", action="store_true", help="Validate and print planned replies without posting.")
+    reply_many_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Attempt remaining replies after a failed reply.",
+    )
 
     review_parser = pr_actions.add_parser("review", help="Submit a compact agent review action.")
     review_parser.add_argument("pr_id", type=int)
@@ -357,6 +378,16 @@ def _dispatch_pr(args: argparse.Namespace, context, client: BitbucketClient) -> 
         return client.create_task(args.pr_id, text=args.text, anchor=anchor)
     if args.action == "reply":
         return client.reply_to_comment(args.pr_id, args.comment_id, text=args.text)
+    if args.action == "reply-many":
+        replies = _load_reply_many_input(Path(args.input))
+        if args.dry_run:
+            return {"dry_run": True, "count": len(replies), "replies": replies}
+        return _reply_many(
+            client,
+            args.pr_id,
+            replies,
+            continue_on_error=args.continue_on_error,
+        )
     if args.action == "review":
         return client.review_pull_request(
             args.pr_id,
@@ -378,6 +409,71 @@ def _dispatch_pr(args: argparse.Namespace, context, client: BitbucketClient) -> 
     if args.action == "reopen":
         return client.reopen_pull_request(args.pr_id, version=args.version)
     raise ValueError(f"Unsupported PR action: {args.action}")
+
+
+def _load_reply_many_input(path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text())
+    except OSError as exc:
+        raise ValueError(f"Unable to read reply input file {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Reply input file is not valid JSON: {exc}") from exc
+    if not isinstance(raw, list):
+        raise ValueError("Reply input must be a JSON array.")
+    replies = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"Reply item {index} must be an object.")
+        unknown = sorted(set(item) - {"comment_id", "text"})
+        if unknown:
+            raise ValueError(f"Reply item {index} has unknown fields: {', '.join(unknown)}.")
+        comment_id = item.get("comment_id")
+        text = item.get("text")
+        if isinstance(comment_id, bool) or not isinstance(comment_id, int):
+            raise ValueError(f"Reply item {index} comment_id must be an integer.")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"Reply item {index} text must be a non-empty string.")
+        replies.append({"comment_id": comment_id, "text": text})
+    return replies
+
+
+def _reply_many(
+    client: BitbucketClient,
+    pr_id: int,
+    replies: list[dict[str, Any]],
+    *,
+    continue_on_error: bool,
+) -> CommandResult:
+    results = []
+    failed = 0
+    for reply in replies:
+        comment_id = reply["comment_id"]
+        try:
+            response = client.reply_to_comment(pr_id, comment_id, text=reply["text"])
+        except BitbucketAPIError as exc:
+            failed += 1
+            results.append(
+                {
+                    "comment_id": comment_id,
+                    "status": "error",
+                    "error": {
+                        "status": exc.status,
+                        "url": exc.url,
+                        "message": str(exc),
+                    },
+                }
+            )
+            if not continue_on_error:
+                break
+        else:
+            results.append({"comment_id": comment_id, "status": "ok", "response": response})
+    payload = {
+        "count": len(replies),
+        "attempted": len(results),
+        "failed": failed,
+        "results": results,
+    }
+    return CommandResult(payload=payload, exit_code=1 if failed else 0)
 
 
 def _current_pull_requests(args: argparse.Namespace, context, client: BitbucketClient) -> dict[str, Any]:
