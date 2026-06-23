@@ -1,0 +1,4 @@
+interface:
+  display_name: "Using btbkt PR Workflows"
+  short_description: "Guide Bitbucket PRs with btbkt CLI"
+  default_prompt: "Use $using-btbkt-pr-workflows to inspect this Bitbucket PR and report open blockers."
