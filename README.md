@@ -3,7 +3,6 @@
 [![PyPI](https://img.shields.io/pypi/v/btbkt.svg)](https://pypi.org/project/btbkt/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/btbkt.svg)](https://pypi.org/project/btbkt/)
 [![Wheel](https://img.shields.io/pypi/wheel/btbkt.svg)](https://pypi.org/project/btbkt/)
-[![Downloads](https://img.shields.io/pypi/dm/btbkt.svg)](https://pypi.org/project/btbkt/)
 [![License](https://img.shields.io/github/license/Cuizi7/btbkt.svg)](LICENSE)
 
 `btbkt` is an agent-facing CLI for Bitbucket Data Center / Server.
