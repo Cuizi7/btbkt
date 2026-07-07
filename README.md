@@ -1,5 +1,11 @@
 # btbkt
 
+[![PyPI](https://img.shields.io/pypi/v/btbkt.svg)](https://pypi.org/project/btbkt/)
+[![Python Versions](https://img.shields.io/pypi/pyversions/btbkt.svg)](https://pypi.org/project/btbkt/)
+[![Wheel](https://img.shields.io/pypi/wheel/btbkt.svg)](https://pypi.org/project/btbkt/)
+[![Downloads](https://img.shields.io/pypi/dm/btbkt.svg)](https://pypi.org/project/btbkt/)
+[![License](https://img.shields.io/github/license/Cuizi7/btbkt.svg)](LICENSE)
+
 `btbkt` is an agent-facing CLI for Bitbucket Data Center / Server.
 
 It is a thin wrapper over Bitbucket's REST API, with a small set of higher-level
@@ -8,11 +14,25 @@ others' PRs, reading review comments, and responding after code changes.
 
 ## Install
 
+For normal use:
+
+```bash
+python -m pip install btbkt
+```
+
+This installs the `btbkt` command:
+
+```bash
+btbkt --help
+```
+
+For local development from a source checkout:
+
 ```bash
 python -m pip install -e .
 ```
 
-Run without installing:
+Run from source without installing:
 
 ```bash
 PYTHONPATH=src python -m btbkt --help
