@@ -7,6 +7,8 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 Transport = Callable[[str, str, Mapping[str, str], Optional[bytes]], Any]
+PARTICIPANT_STATUSES = {"APPROVED", "UNAPPROVED", "NEEDS_WORK"}
+_NO_JSON_BODY = object()
 
 
 class BitbucketAPIError(RuntimeError):
@@ -166,41 +168,79 @@ class BitbucketClient:
             json_body={"text": text, "parent": {"id": comment_id}},
         )
 
-    def approve_pull_request(self, pr_id: int) -> Any:
-        return self.submit_review(pr_id, participant_status="APPROVED")
+    def update_participant_status(
+        self,
+        pr_id: int,
+        user_slug: str,
+        status: str,
+        last_reviewed_commit: Optional[str] = None,
+    ) -> Any:
+        self._validate_participant_status(status)
+        payload = {"status": status}
+        if last_reviewed_commit:
+            payload["lastReviewedCommit"] = last_reviewed_commit
+        return self._request(
+            "PUT",
+            self._repo_path("pull-requests", str(pr_id), "participants", user_slug),
+            json_body=payload,
+        )
 
-    def unapprove_pull_request(self, pr_id: int) -> Any:
-        return self.submit_review(pr_id, participant_status="UNAPPROVED")
-
-    def request_changes(self, pr_id: int, *, comment: Optional[str] = None) -> Any:
-        return self.submit_review(pr_id, comment=comment, participant_status="NEEDS_WORK")
-
-    def submit_review(
+    def get_pending_review(
         self,
         pr_id: int,
         *,
-        comment: Optional[str] = None,
+        limit: Optional[int] = None,
+        start: Optional[int] = None,
+    ) -> Any:
+        return self._request(
+            "GET",
+            self._repo_path("pull-requests", str(pr_id), "review"),
+            query={"limit": limit, "start": start},
+        )
+
+    def create_pending_comment(
+        self,
+        pr_id: int,
+        *,
+        text: str,
+        anchor: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        payload: dict[str, Any] = {"text": text, "state": "PENDING"}
+        if anchor is not None:
+            payload["anchor"] = anchor
+        return self._request(
+            "POST",
+            self._repo_path("pull-requests", str(pr_id), "comments"),
+            json_body=payload,
+        )
+
+    def complete_pending_review(
+        self,
+        pr_id: int,
+        *,
         participant_status: Optional[str] = None,
         last_reviewed_commit: Optional[str] = None,
     ) -> Any:
         payload: dict[str, Any] = {}
-        if comment:
-            payload["commentText"] = comment
-        if participant_status:
+        if participant_status is not None:
+            self._validate_participant_status(participant_status)
             payload["participantStatus"] = participant_status
         if last_reviewed_commit:
             payload["lastReviewedCommit"] = last_reviewed_commit
-        if not payload:
-            raise ValueError("Review submit requires comment text or participant status.")
-        return self._request("PUT", self._repo_path("pull-requests", str(pr_id), "review"), json_body=payload)
+        return self._request(
+            "PUT",
+            self._repo_path("pull-requests", str(pr_id), "review"),
+            json_body=payload,
+        )
+
+    def discard_pending_review(self, pr_id: int) -> Any:
+        return self._request("DELETE", self._repo_path("pull-requests", str(pr_id), "review"))
 
     def merge_pull_request(self, pr_id: int, *, version: Optional[int] = None, message: Optional[str] = None) -> Any:
-        return self._request(
-            "POST",
-            self._repo_path("pull-requests", str(pr_id), "merge"),
-            query={"version": version},
-            json_body={"message": message} if message else None,
-        )
+        request_kwargs: dict[str, Any] = {"query": {"version": version}}
+        if message:
+            request_kwargs["json_body"] = {"message": message}
+        return self._request("POST", self._repo_path("pull-requests", str(pr_id), "merge"), **request_kwargs)
 
     def decline_pull_request(self, pr_id: int, *, version: Optional[int] = None) -> Any:
         return self._request(
@@ -216,26 +256,14 @@ class BitbucketClient:
             query={"version": version},
         )
 
-    def review_pull_request(
+    def raw(
         self,
-        pr_id: int,
+        method: str,
+        path: str,
         *,
-        comment: Optional[str] = None,
-        approve: bool = False,
-        unapprove: bool = False,
-        needs_work: bool = False,
-    ) -> dict[str, Any]:
-        statuses = [approve, unapprove, needs_work]
-        if sum(bool(status) for status in statuses) > 1:
-            raise ValueError("Choose only one of approve, unapprove, or needs_work.")
-        if approve or unapprove or needs_work:
-            status = "APPROVED" if approve else "UNAPPROVED" if unapprove else "NEEDS_WORK"
-            return {"review": self.submit_review(pr_id, comment=comment, participant_status=status)}
-        if comment:
-            return {"comment": self.comment_pull_request(pr_id, text=comment)}
-        raise ValueError("Review requires --comment, --approve, --unapprove, or --needs-work.")
-
-    def raw(self, method: str, path: str, *, query: Optional[dict[str, Any]] = None, json_body: Any = None) -> Any:
+        query: Optional[dict[str, Any]] = None,
+        json_body: Any = _NO_JSON_BODY,
+    ) -> Any:
         if not path.startswith("/"):
             path = "/" + path
         return self._request(method.upper(), path, query=query, json_body=json_body)
@@ -246,9 +274,9 @@ class BitbucketClient:
         path: str,
         *,
         query: Optional[dict[str, Any]] = None,
-        json_body: Any = None,
+        json_body: Any = _NO_JSON_BODY,
     ) -> Any:
-        body = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+        body = None if json_body is _NO_JSON_BODY else json.dumps(json_body).encode("utf-8")
         headers = {
             self.auth_header[0]: self.auth_header[1],
             "Accept": "application/json",
@@ -305,6 +333,11 @@ class BitbucketClient:
         if not value:
             raise ValueError("Missing repo. Set --repo or run in a Bitbucket git checkout.")
         return value
+
+    @staticmethod
+    def _validate_participant_status(status: str) -> None:
+        if status not in PARTICIPANT_STATUSES:
+            raise ValueError("Participant status must be APPROVED, UNAPPROVED, or NEEDS_WORK.")
 
 
 def default_transport(method: str, url: str, headers: Mapping[str, str], body: Optional[bytes]) -> Any:

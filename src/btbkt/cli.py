@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, TextIO, Union
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .client import BitbucketAPIError, BitbucketClient, Transport
 from .compact import (
@@ -43,12 +45,14 @@ def main(
     stderr = sys.stderr if stderr is None else stderr
     parser = build_parser()
     args = parser.parse_args(argv)
+    effective_env = os.environ if env is None else env
+    error_redactions: tuple[str, ...] = ()
 
     try:
         git = read_git_info(cwd)
         require_project, require_repo = _context_requirements(args)
         context = resolve_context(
-            env=os.environ if env is None else env,
+            env=effective_env,
             git=git,
             base_url=args.base_url,
             username=args.username,
@@ -61,6 +65,7 @@ def main(
             require_project=require_project,
             require_repo=require_repo,
         )
+        error_redactions = _error_redaction_values(args, effective_env, context)
         client = BitbucketClient(
             base_url=context.base_url,
             auth_header=context.auth_header,
@@ -68,7 +73,7 @@ def main(
             repo=context.repo,
             transport=transport,
         )
-        result = _dispatch(args, context, client)
+        result = _dispatch(args, context, client, error_redactions)
         exit_code = 0
         if isinstance(result, CommandResult):
             exit_code = result.exit_code
@@ -77,10 +82,11 @@ def main(
         _write_json(stderr, {"error": "configuration_error", "message": str(exc)})
         return 2
     except (BitbucketAPIError, ValueError) as exc:
-        payload: dict[str, Any] = {"error": exc.__class__.__name__, "message": str(exc)}
+        message = _redact_text(str(exc), error_redactions)
+        payload: dict[str, Any] = {"error": exc.__class__.__name__, "message": message}
         if isinstance(exc, BitbucketAPIError):
             payload["status"] = exc.status
-            payload["url"] = exc.url
+            payload["url"] = _redact_text(_strip_url_userinfo(exc.url), error_redactions)
         _write_json(stderr, payload)
         return 1
 
@@ -246,6 +252,20 @@ def build_parser() -> argparse.ArgumentParser:
     review_parser.add_argument("--unapprove", action="store_true")
     review_parser.add_argument("--needs-work", action="store_true")
 
+    review_pending_parser = pr_actions.add_parser("review-pending", help="Show the current user's pending review.")
+    review_pending_parser.add_argument("pr_id", type=int)
+    review_pending_parser.add_argument("--limit", type=int)
+    review_pending_parser.add_argument("--start", type=int)
+
+    review_submit_parser = pr_actions.add_parser("review-submit", help="Complete the current user's pending review.")
+    review_submit_parser.add_argument("pr_id", type=int)
+    review_submit_parser.add_argument("--approve", action="store_true")
+    review_submit_parser.add_argument("--unapprove", action="store_true")
+    review_submit_parser.add_argument("--needs-work", action="store_true")
+
+    review_discard_parser = pr_actions.add_parser("review-discard", help="Discard the current user's pending review.")
+    review_discard_parser.add_argument("pr_id", type=int)
+
     approve_parser = pr_actions.add_parser("approve", help="Approve a PR.")
     approve_parser.add_argument("pr_id", type=int)
 
@@ -268,10 +288,17 @@ def build_parser() -> argparse.ArgumentParser:
     reopen_parser.add_argument("pr_id", type=int)
     reopen_parser.add_argument("--version", type=int)
 
+    raw_parser = resources.add_parser("raw", help="Call a controlled Bitbucket REST endpoint.")
+    raw_parser.add_argument("method", choices=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    raw_parser.add_argument("path", help="Absolute Bitbucket REST path beginning with /rest/.")
+    raw_parser.add_argument("--json", help="Strict JSON request body.")
+
     return parser
 
 
 def _context_requirements(args: argparse.Namespace) -> tuple[bool, bool]:
+    if args.resource == "raw":
+        return False, False
     if args.resource == "project" and args.action == "list":
         return False, False
     if args.resource == "project" and args.action == "get":
@@ -281,13 +308,39 @@ def _context_requirements(args: argparse.Namespace) -> tuple[bool, bool]:
     return True, True
 
 
-def _dispatch(args: argparse.Namespace, context, client: BitbucketClient) -> Any:
+def _dispatch(
+    args: argparse.Namespace,
+    context,
+    client: BitbucketClient,
+    error_redactions: Sequence[str],
+) -> Any:
     if args.resource == "project":
         return _dispatch_project(args, client)
     if args.resource == "repo":
         return _dispatch_repo(args, client)
     if args.resource == "pr":
-        return _dispatch_pr(args, context, client)
+        return _dispatch_pr(args, context, client, error_redactions)
+    if args.resource == "raw":
+        decoded_path = urlsplit(args.path).path
+        while True:
+            next_decoded_path = unquote(decoded_path)
+            if next_decoded_path == decoded_path:
+                break
+            decoded_path = next_decoded_path
+        path_segments = decoded_path.replace("\\", "/").split("/")
+        if (
+            "://" in args.path
+            or not args.path.startswith("/rest/")
+            or any(segment in {".", ".."} or ";" in segment for segment in path_segments)
+        ):
+            raise ValueError("Raw target must be a path beginning with /rest/; absolute URLs are not allowed.")
+        if args.json is None:
+            return client.raw(args.method, args.path)
+        try:
+            json_body = json.loads(args.json, parse_constant=_reject_json_constant)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--json must be valid JSON: {exc}") from exc
+        return client.raw(args.method, args.path, json_body=json_body)
     raise ValueError(f"Unsupported resource: {args.resource}")
 
 
@@ -307,7 +360,12 @@ def _dispatch_repo(args: argparse.Namespace, client: BitbucketClient) -> Any:
     raise ValueError(f"Unsupported repo action: {args.action}")
 
 
-def _dispatch_pr(args: argparse.Namespace, context, client: BitbucketClient) -> Any:
+def _dispatch_pr(
+    args: argparse.Namespace,
+    context,
+    client: BitbucketClient,
+    error_redactions: Sequence[str],
+) -> Any:
     if args.action == "list":
         return client.list_pull_requests(
             state=args.state,
@@ -399,21 +457,46 @@ def _dispatch_pr(args: argparse.Namespace, context, client: BitbucketClient) -> 
             args.pr_id,
             replies,
             continue_on_error=args.continue_on_error,
+            error_redactions=error_redactions,
         )
     if args.action == "review":
-        return client.review_pull_request(
+        status = _decision_status(args)
+        if args.comment is not None and not args.comment.strip():
+            raise ValueError("Review comment must be a non-empty string.")
+        if args.comment is not None and status:
+            return _combined_review(
+                client,
+                context,
+                args.pr_id,
+                args.comment,
+                status,
+                error_redactions=error_redactions,
+            )
+        if args.comment is not None:
+            return client.comment_pull_request(args.pr_id, text=args.comment)
+        if status:
+            return _update_review_status(client, context, args.pr_id, status)
+        raise ValueError("Review requires --comment, --approve, --unapprove, or --needs-work.")
+    if args.action == "review-pending":
+        return client.get_pending_review(args.pr_id, limit=args.limit, start=args.start)
+    if args.action == "review-submit":
+        status = _decision_status(args)
+        if status is None:
+            raise ValueError("Review submit requires exactly one decision.")
+        pull_request = client.get_pull_request(args.pr_id)
+        return client.complete_pending_review(
             args.pr_id,
-            comment=args.comment,
-            approve=args.approve,
-            unapprove=args.unapprove,
-            needs_work=args.needs_work,
+            participant_status=status,
+            last_reviewed_commit=_pull_request_commit(pull_request),
         )
+    if args.action == "review-discard":
+        return client.discard_pending_review(args.pr_id)
     if args.action == "approve":
-        return client.approve_pull_request(args.pr_id)
+        return _update_review_status(client, context, args.pr_id, "APPROVED")
     if args.action == "unapprove":
-        return client.unapprove_pull_request(args.pr_id)
+        return _update_review_status(client, context, args.pr_id, "UNAPPROVED")
     if args.action == "needs-work":
-        return client.request_changes(args.pr_id)
+        return _update_review_status(client, context, args.pr_id, "NEEDS_WORK")
     if args.action == "merge":
         return client.merge_pull_request(args.pr_id, version=args.version, message=args.message)
     if args.action == "decline":
@@ -421,6 +504,170 @@ def _dispatch_pr(args: argparse.Namespace, context, client: BitbucketClient) -> 
     if args.action == "reopen":
         return client.reopen_pull_request(args.pr_id, version=args.version)
     raise ValueError(f"Unsupported PR action: {args.action}")
+
+
+def _pull_request_commit(pull_request: Mapping[str, Any]) -> Optional[str]:
+    from_ref = pull_request.get("fromRef")
+    if not isinstance(from_ref, Mapping):
+        return None
+    commit = from_ref.get("latestCommit")
+    return commit if isinstance(commit, str) and commit else None
+
+
+def _current_user_slug(pull_request: Mapping[str, Any], username: str) -> str:
+    participants = []
+    for key in ("reviewers", "participants"):
+        values = pull_request.get(key)
+        if isinstance(values, list):
+            participants.extend(values)
+
+    for participant in participants:
+        if not isinstance(participant, Mapping):
+            continue
+        user = participant.get("user")
+        if not isinstance(user, Mapping):
+            continue
+        slug = user.get("slug")
+        name = user.get("name")
+        if username in (slug, name):
+            return slug if isinstance(slug, str) and slug else username
+    return username
+
+
+def _decision_status(args: argparse.Namespace) -> Optional[str]:
+    decisions = [
+        (getattr(args, "approve", False), "APPROVED"),
+        (getattr(args, "unapprove", False), "UNAPPROVED"),
+        (getattr(args, "needs_work", False), "NEEDS_WORK"),
+    ]
+    selected = [status for enabled, status in decisions if enabled]
+    if len(selected) > 1:
+        raise ValueError("Choose exactly one of --approve, --unapprove, or --needs-work.")
+    return selected[0] if selected else None
+
+
+def _update_review_status(client, context, pr_id: int, status: str) -> Any:
+    pull_request = client.get_pull_request(pr_id)
+    username = context.username
+    if not username:
+        raise ValueError("Missing Bitbucket username for participant status update.")
+    return client.update_participant_status(
+        pr_id,
+        _current_user_slug(pull_request, username),
+        status,
+        _pull_request_commit(pull_request),
+    )
+
+
+def _combined_review(
+    client,
+    context,
+    pr_id: int,
+    comment: str,
+    status: str,
+    *,
+    error_redactions: Sequence[str],
+) -> CommandResult:
+    pull_request = client.get_pull_request(pr_id)
+    pending_review = client.get_pending_review(pr_id)
+    decision_flag = {
+        "APPROVED": "--approve",
+        "UNAPPROVED": "--unapprove",
+        "NEEDS_WORK": "--needs-work",
+    }[status]
+    command_parts = ["btbkt"]
+    for flag, value in (
+        ("--base-url", _strip_url_userinfo(context.base_url)),
+        ("--username", context.username),
+        ("--project", context.project),
+        ("--repo", context.repo),
+    ):
+        if value:
+            command_parts.extend((flag, shlex.quote(value)))
+    command_prefix = " ".join(command_parts)
+    recovery = [
+        f"{command_prefix} pr review-pending {pr_id}",
+        f"{command_prefix} pr review-submit {pr_id} {decision_flag}",
+        f"{command_prefix} pr review-discard {pr_id}",
+    ]
+    pending_values = pending_review.get("values") if isinstance(pending_review, Mapping) else None
+    if isinstance(pending_values, list) and pending_values:
+        return CommandResult(
+            payload={
+                "status": "blocked",
+                "steps": [{"operation": "preflight_pending_review", "response": pending_review}],
+                "recovery": recovery,
+            },
+            exit_code=1,
+        )
+
+    comment_response = client.create_pending_comment(pr_id, text=comment)
+    steps = [{"operation": "create_pending_comment", "status": "ok", "response": comment_response}]
+    try:
+        completion_response = client.complete_pending_review(
+            pr_id,
+            participant_status=status,
+            last_reviewed_commit=_pull_request_commit(pull_request),
+        )
+    except BitbucketAPIError as exc:
+        steps.append(
+            {
+                "operation": "complete_pending_review",
+                "status": "error",
+                "error": {
+                    "status": exc.status,
+                    "url": _redact_text(_strip_url_userinfo(exc.url), error_redactions),
+                    "message": _redact_text(str(exc), error_redactions),
+                },
+            }
+        )
+        return CommandResult(
+            payload={"status": "partial", "steps": steps, "recovery": recovery},
+            exit_code=1,
+        )
+
+    steps.append(
+        {
+            "operation": "complete_pending_review",
+            "status": "ok",
+            "response": completion_response,
+        }
+    )
+    return CommandResult(payload={"status": "completed", "steps": steps})
+
+
+def _strip_url_userinfo(url: str) -> str:
+    parsed = urlsplit(url)
+    if "@" not in parsed.netloc:
+        return url
+    sanitized_netloc = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parsed.scheme, sanitized_netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _error_redaction_values(args, env: Mapping[str, str], context) -> tuple[str, ...]:
+    parsed_base_url = urlsplit(context.base_url)
+    url_username = parsed_base_url.username
+    url_password = parsed_base_url.password
+    candidates = (
+        args.password or env.get("BITBUCKET_PASSWORD"),
+        args.token or env.get("BITBUCKET_TOKEN"),
+        context.auth_header[1],
+        url_username,
+        unquote(url_username) if url_username else None,
+        url_password,
+        unquote(url_password) if url_password else None,
+    )
+    return tuple(sorted({value for value in candidates if value}, key=len, reverse=True))
+
+
+def _redact_text(text: str, redactions: Sequence[str]) -> str:
+    for value in redactions:
+        text = text.replace(value, "[REDACTED]")
+    return text
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"--json must use standard JSON values; {value} is not allowed.")
 
 
 def _load_reply_many_input(path: Path) -> list[dict[str, Any]]:
@@ -455,6 +702,7 @@ def _reply_many(
     replies: list[dict[str, Any]],
     *,
     continue_on_error: bool,
+    error_redactions: Sequence[str],
 ) -> CommandResult:
     results = []
     failed = 0
@@ -470,8 +718,8 @@ def _reply_many(
                     "status": "error",
                     "error": {
                         "status": exc.status,
-                        "url": exc.url,
-                        "message": str(exc),
+                        "url": _redact_text(_strip_url_userinfo(exc.url), error_redactions),
+                        "message": _redact_text(str(exc), error_redactions),
                     },
                 }
             )

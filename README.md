@@ -67,6 +67,17 @@ skills/using-btbkt-pr-workflows/SKILL.md
 Use that skill when an agent needs to create a PR, review someone else's PR, or
 address review feedback on its own PR.
 
+Install the canonical repository copy for local agents and check for drift:
+
+```bash
+make skill-sync
+make skill-check
+```
+
+The sync replaces the installed skill directory with an exact copy. To inspect
+a different destination without changing it, run
+`python scripts/sync_skill.py --check --destination PATH`.
+
 ## Examples
 
 Find the PR for the current git branch:
@@ -107,11 +118,31 @@ btbkt pr reply-many 390 --input replies.json
 comment can remain `OPEN` after a reply, so use
 `open_comments_without_replies` for the remaining-unreplied count.
 
-Submit a review decision:
+Post only a public comment, or submit only a direct participant decision:
 
 ```bash
-btbkt pr review 390 --comment "Looks good." --approve
+btbkt pr review 390 --comment "I have one question about the fallback."
+btbkt pr approve 390
+btbkt pr needs-work 390
+```
+
+When text and a decision belong to one review, use the pending-review lifecycle.
+If completion fails after creating the pending comment, inspect state before
+submitting or discarding it; do not blindly resend the comment:
+
+```bash
 btbkt pr review 390 --comment "Please add a regression test." --needs-work
+btbkt pr review-pending 390
+btbkt pr review-submit 390 --needs-work
+btbkt pr review-discard 390
+```
+
+Use the controlled raw surface only when a compact command cannot express the
+required operation. Paths must begin with `/rest/`, and mutating methods require
+the same explicit authorization as other writes:
+
+```bash
+btbkt raw GET /rest/api/1.0/projects/PROJ/repos/demo/pull-requests/390
 ```
 
 ## Notes

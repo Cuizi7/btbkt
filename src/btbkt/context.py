@@ -29,6 +29,7 @@ class BitbucketContext:
     repo: Optional[str] = None
     source_branch: Optional[str] = None
     target_branch: Optional[str] = None
+    username: Optional[str] = None
 
 
 def parse_remote_url(remote_url: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -123,6 +124,7 @@ def resolve_context(
     return BitbucketContext(
         base_url=_strip_trailing_slash(base_url),
         auth_header=auth_header,
+        username=username,
         project=project,
         repo=repo,
         source_branch=source_branch,

@@ -1,6 +1,6 @@
 import pytest
 
-from btbkt.context import ConfigError, GitInfo, parse_remote_url, resolve_context
+from btbkt.context import BitbucketContext, ConfigError, GitInfo, parse_remote_url, resolve_context
 
 
 def test_parse_remote_url_supports_common_bitbucket_data_center_urls():
@@ -51,6 +51,7 @@ def test_resolve_context_uses_basic_auth_env_and_git_repo_context():
     context = resolve_context(env=env, git=git)
 
     assert context.base_url == "https://bitbucket.internal"
+    assert context.username == "alice"
     name, value = context.auth_header
     assert name == "Authorization"
     assert value.startswith("Basic ")
@@ -83,11 +84,29 @@ def test_resolve_context_accepts_password_instead_of_token():
     context = resolve_context(env=env, git=git)
 
     assert context.base_url == "https://bitbucket.internal"
+    assert context.username == "alice"
     name, value = context.auth_header
     assert name == "Authorization"
     assert value.startswith("Basic ")
     assert context.project == "ABC"
     assert context.repo == "demo"
+
+
+def test_bitbucket_context_preserves_existing_positional_field_order():
+    context = BitbucketContext(
+        "https://bitbucket.internal",
+        ("Authorization", "Basic token"),
+        "ABC",
+        "demo",
+        "feature/review",
+        "main",
+    )
+
+    assert context.project == "ABC"
+    assert context.repo == "demo"
+    assert context.source_branch == "feature/review"
+    assert context.target_branch == "main"
+    assert context.username is None
 
 
 def test_resolve_context_does_not_read_project_repo_or_legacy_btbkt_env():

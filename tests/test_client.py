@@ -152,7 +152,7 @@ def test_create_task_posts_blocker_comment():
     assert json.loads(body.decode("utf-8")) == {"text": "Please add a test.", "severity": "BLOCKER"}
 
 
-def test_review_with_approval_uses_official_review_endpoint():
+def test_update_participant_status_uses_participant_endpoint_and_commit():
     transport = CapturingTransport()
     client = BitbucketClient(
         base_url="https://bitbucket.internal",
@@ -162,19 +162,18 @@ def test_review_with_approval_uses_official_review_endpoint():
         transport=transport,
     )
 
-    result = client.review_pull_request(12, comment="Looks good.", approve=True)
+    client.update_participant_status(12, "alice-slug", "NEEDS_WORK", "abc123")
 
-    assert result == {"review": {"ok": True, "method": "PUT"}}
-    review_request = transport.requests[0]
-    assert review_request[0] == "PUT"
-    assert review_request[1].endswith("/pull-requests/12/review")
-    assert json.loads(review_request[3].decode("utf-8")) == {
-        "commentText": "Looks good.",
-        "participantStatus": "APPROVED",
+    method, url, _headers, body = transport.requests[0]
+    assert method == "PUT"
+    assert url.endswith("/pull-requests/12/participants/alice-slug")
+    assert json.loads(body.decode("utf-8")) == {
+        "status": "NEEDS_WORK",
+        "lastReviewedCommit": "abc123",
     }
 
 
-def test_review_comment_without_status_posts_a_normal_comment():
+def test_pending_review_methods_use_review_lifecycle_endpoints():
     transport = CapturingTransport()
     client = BitbucketClient(
         base_url="https://bitbucket.internal",
@@ -184,13 +183,101 @@ def test_review_comment_without_status_posts_a_normal_comment():
         transport=transport,
     )
 
-    result = client.review_pull_request(12, comment="Please check this.")
+    client.get_pending_review(12, limit=25, start=10)
+    client.create_pending_comment(12, text="Needs tests.")
+    client.complete_pending_review(
+        12,
+        participant_status="NEEDS_WORK",
+        last_reviewed_commit="abc123",
+    )
+    client.discard_pending_review(12)
 
-    assert result == {"comment": {"ok": True, "method": "POST"}}
-    comment_request = transport.requests[0]
-    assert comment_request[0] == "POST"
-    assert comment_request[1].endswith("/pull-requests/12/comments")
-    assert json.loads(comment_request[3].decode("utf-8")) == {"text": "Please check this."}
+    assert [(request[0], urlparse(request[1]).path) for request in transport.requests] == [
+        ("GET", "/rest/api/1.0/projects/ABC/repos/demo/pull-requests/12/review"),
+        ("POST", "/rest/api/1.0/projects/ABC/repos/demo/pull-requests/12/comments"),
+        ("PUT", "/rest/api/1.0/projects/ABC/repos/demo/pull-requests/12/review"),
+        ("DELETE", "/rest/api/1.0/projects/ABC/repos/demo/pull-requests/12/review"),
+    ]
+    assert parse_qs(urlparse(transport.requests[0][1]).query) == {
+        "limit": ["25"],
+        "start": ["10"],
+    }
+    assert json.loads(transport.requests[1][3].decode("utf-8")) == {
+        "text": "Needs tests.",
+        "state": "PENDING",
+    }
+    assert json.loads(transport.requests[2][3].decode("utf-8")) == {
+        "participantStatus": "NEEDS_WORK",
+        "lastReviewedCommit": "abc123",
+    }
+    assert transport.requests[3][3] is None
+
+
+def test_create_pending_comment_conditionally_includes_anchor():
+    transport = CapturingTransport()
+    client = BitbucketClient(
+        base_url="https://bitbucket.internal",
+        auth_header=("Authorization", "Basic token"),
+        project="ABC",
+        repo="demo",
+        transport=transport,
+    )
+    anchor = {"path": "src/app.py", "line": 12, "lineType": "ADDED"}
+
+    client.create_pending_comment(12, text="General note.")
+    client.create_pending_comment(12, text="Inline note.", anchor=anchor)
+
+    assert json.loads(transport.requests[0][3].decode("utf-8")) == {
+        "text": "General note.",
+        "state": "PENDING",
+    }
+    assert json.loads(transport.requests[1][3].decode("utf-8")) == {
+        "text": "Inline note.",
+        "state": "PENDING",
+        "anchor": anchor,
+    }
+
+
+def test_complete_pending_review_allows_commit_without_status():
+    transport = CapturingTransport()
+    client = BitbucketClient(
+        base_url="https://bitbucket.internal",
+        auth_header=("Authorization", "Basic token"),
+        project="ABC",
+        repo="demo",
+        transport=transport,
+    )
+
+    client.complete_pending_review(12, last_reviewed_commit="abc123")
+
+    method, url, _headers, body = transport.requests[0]
+    assert method == "PUT"
+    assert url.endswith("/pull-requests/12/review")
+    assert json.loads(body.decode("utf-8")) == {"lastReviewedCommit": "abc123"}
+
+
+def test_participant_status_methods_reject_unknown_status():
+    transport = CapturingTransport()
+    client = BitbucketClient(
+        base_url="https://bitbucket.internal",
+        auth_header=("Authorization", "Basic token"),
+        project="ABC",
+        repo="demo",
+        transport=transport,
+    )
+
+    for call in (
+        lambda: client.update_participant_status(12, "alice", "DECLINED"),
+        lambda: client.complete_pending_review(12, participant_status="DECLINED"),
+    ):
+        try:
+            call()
+        except ValueError as exc:
+            assert "APPROVED, UNAPPROVED, or NEEDS_WORK" in str(exc)
+        else:
+            raise AssertionError("Unknown participant status was accepted")
+
+    assert transport.requests == []
 
 
 def test_reply_to_comment_posts_parent_comment_payload():
@@ -212,3 +299,71 @@ def test_reply_to_comment_posts_parent_comment_payload():
         "text": "Fixed and covered by tests.",
         "parent": {"id": 15466},
     }
+
+
+def test_raw_omitted_json_body_sends_no_body_or_content_type():
+    transport = CapturingTransport()
+    client = BitbucketClient(
+        base_url="https://bitbucket.internal",
+        auth_header=("Authorization", "Basic token"),
+        transport=transport,
+    )
+
+    client.raw("GET", "/rest/api/1.0/projects")
+
+    method, _url, headers, body = transport.requests[0]
+    assert method == "GET"
+    assert body is None
+    assert "Content-Type" not in headers
+
+
+def test_raw_explicit_json_null_sends_json_body_and_content_type():
+    transport = CapturingTransport()
+    client = BitbucketClient(
+        base_url="https://bitbucket.internal",
+        auth_header=("Authorization", "Basic token"),
+        transport=transport,
+    )
+
+    client.raw("PATCH", "/rest/api/1.0/example", json_body=None)
+
+    method, _url, headers, body = transport.requests[0]
+    assert method == "PATCH"
+    assert body == b"null"
+    assert headers["Content-Type"] == "application/json"
+
+
+def test_merge_without_message_sends_no_body_or_content_type():
+    transport = CapturingTransport()
+    client = BitbucketClient(
+        base_url="https://bitbucket.internal",
+        auth_header=("Authorization", "Basic token"),
+        project="ABC",
+        repo="demo",
+        transport=transport,
+    )
+
+    client.merge_pull_request(42)
+
+    method, _url, headers, body = transport.requests[0]
+    assert method == "POST"
+    assert body is None
+    assert "Content-Type" not in headers
+
+
+def test_merge_with_message_sends_json_body_and_content_type():
+    transport = CapturingTransport()
+    client = BitbucketClient(
+        base_url="https://bitbucket.internal",
+        auth_header=("Authorization", "Basic token"),
+        project="ABC",
+        repo="demo",
+        transport=transport,
+    )
+
+    client.merge_pull_request(42, message="Merge after review")
+
+    method, _url, headers, body = transport.requests[0]
+    assert method == "POST"
+    assert json.loads(body.decode("utf-8")) == {"message": "Merge after review"}
+    assert headers["Content-Type"] == "application/json"

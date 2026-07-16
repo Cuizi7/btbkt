@@ -37,7 +37,9 @@ The suggestions are directionally correct, but not all should be accepted litera
 
 - Do not implement a general Bitbucket comment resolution workflow unless the API and local server behavior are verified.
 - Do not rename Bitbucket's `OPEN` / `RESOLVED` states or claim a replied comment is resolved.
-- Do not add a broad raw REST escape hatch for this workflow.
+- Do not add an automatic or unconstrained raw REST fallback inside this
+  historical reply/review-loop workflow. A separate controlled top-level raw
+  command may be used for explicit operations outside the compact command set.
 - Do not make top-level comments as an automatic fallback for failed replies.
 
 ## API And Command Design

@@ -1,6 +1,8 @@
 import io
 import json
 
+import pytest
+
 from btbkt.client import BitbucketAPIError
 from btbkt.cli import main
 
@@ -12,6 +14,41 @@ class CapturingTransport:
     def __call__(self, method, url, headers, body):
         self.requests.append((method, url, headers, body))
         return {"url": url, "method": method}
+
+
+PULL_REQUEST = {
+    "id": 42,
+    "fromRef": {"latestCommit": "abc123"},
+    "reviewers": [{"user": {"name": "alice", "slug": "alice-slug"}}],
+}
+
+
+class ReviewWorkflowTransport:
+    def __init__(self, *, pending=None, fail_completion=False):
+        self.requests = []
+        self.pending = {"values": []} if pending is None else pending
+        self.fail_completion = fail_completion
+
+    def __call__(self, method, url, headers, body):
+        self.requests.append((method, url, headers, body))
+        if method == "GET" and url.endswith("/pull-requests/42"):
+            return PULL_REQUEST
+        if method == "GET" and "/pull-requests/42/review" in url:
+            return self.pending
+        if method == "POST" and url.endswith("/pull-requests/42/comments"):
+            return {"id": 99, "state": "PENDING", "text": "LGTM"}
+        if method == "PUT" and url.endswith("/pull-requests/42/review"):
+            if self.fail_completion:
+                raise BitbucketAPIError(409, url, "completion conflict")
+            return {"completed": True}
+        return {"ok": True}
+
+
+ENV = {
+    "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+    "BITBUCKET_USERNAME": "alice",
+    "BITBUCKET_TOKEN": "token",
+}
 
 
 class FailingReplyTransport:
@@ -393,28 +430,17 @@ class TruncatedUnifiedReviewContextTransport:
         raise AssertionError(f"Unexpected URL: {url}")
 
 
-def test_cli_review_prints_json_and_submits_approval_review():
+@pytest.mark.parametrize(
+    ("action", "status"),
+    [("approve", "APPROVED"), ("unapprove", "UNAPPROVED"), ("needs-work", "NEEDS_WORK")],
+)
+def test_cli_standalone_decisions_update_current_participant(action, status):
     stdout = io.StringIO()
     stderr = io.StringIO()
-    transport = CapturingTransport()
+    transport = ReviewWorkflowTransport()
     exit_code = main(
-        [
-            "--project",
-            "ABC",
-            "--repo",
-            "demo",
-            "pr",
-            "review",
-            "42",
-            "--comment",
-            "LGTM",
-            "--approve",
-        ],
-        env={
-            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
-            "BITBUCKET_USERNAME": "alice",
-            "BITBUCKET_TOKEN": "token",
-        },
+        ["--project", "ABC", "--repo", "demo", "pr", action, "42"],
+        env=ENV,
         stdout=stdout,
         stderr=stderr,
         transport=transport,
@@ -422,9 +448,285 @@ def test_cli_review_prints_json_and_submits_approval_review():
 
     assert exit_code == 0
     assert stderr.getvalue() == ""
+    assert [request[0] for request in transport.requests] == ["GET", "PUT"]
+    assert transport.requests[1][1].endswith("/pull-requests/42/participants/alice-slug")
+    assert json.loads(transport.requests[1][3].decode("utf-8")) == {
+        "status": status,
+        "lastReviewedCommit": "abc123",
+    }
+
+
+@pytest.mark.parametrize(
+    ("flag", "status"),
+    [("--approve", "APPROVED"), ("--unapprove", "UNAPPROVED"), ("--needs-work", "NEEDS_WORK")],
+)
+def test_cli_decision_only_review_updates_current_participant(flag, status):
+    stdout = io.StringIO()
+    transport = ReviewWorkflowTransport()
+
+    exit_code = main(
+        ["--project", "ABC", "--repo", "demo", "pr", "review", "42", flag],
+        env=ENV,
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert [request[0] for request in transport.requests] == ["GET", "PUT"]
+    assert transport.requests[1][1].endswith("/pull-requests/42/participants/alice-slug")
+    assert json.loads(transport.requests[1][3].decode("utf-8")) == {
+        "status": status,
+        "lastReviewedCommit": "abc123",
+    }
+
+
+def test_cli_comment_only_review_posts_public_comment():
+    stdout = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        ["--project", "ABC", "--repo", "demo", "pr", "review", "42", "--comment", "LGTM"],
+        env=ENV,
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    method, url, _headers, body = transport.requests[0]
+    assert method == "POST"
+    assert url.endswith("/pull-requests/42/comments")
+    assert json.loads(body.decode("utf-8")) == {"text": "LGTM"}
+
+
+@pytest.mark.parametrize("comment", ["", "   "])
+@pytest.mark.parametrize("decision", [[], ["--approve"]])
+def test_cli_review_rejects_blank_comment_before_any_request(comment, decision):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        [
+            "--project", "ABC", "--repo", "demo", "pr", "review", "42",
+            "--comment", comment, *decision,
+        ],
+        env=ENV,
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert transport.requests == []
+    assert "non-empty" in json.loads(stderr.getvalue())["message"]
+
+
+def test_cli_combined_review_creates_and_completes_pending_review_in_order():
+    stdout = io.StringIO()
+    transport = ReviewWorkflowTransport()
+
+    exit_code = main(
+        [
+            "--project", "ABC", "--repo", "demo", "pr", "review", "42",
+            "--comment", "LGTM", "--approve",
+        ],
+        env=ENV,
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert [request[0] for request in transport.requests] == ["GET", "GET", "POST", "PUT"]
+    assert json.loads(transport.requests[2][3].decode("utf-8")) == {
+        "text": "LGTM",
+        "state": "PENDING",
+    }
+    assert json.loads(transport.requests[3][3].decode("utf-8")) == {
+        "participantStatus": "APPROVED",
+        "lastReviewedCommit": "abc123",
+    }
     output = json.loads(stdout.getvalue())
-    assert output["review"]["method"] == "PUT"
-    assert [request[1].rsplit("/", 1)[-1] for request in transport.requests] == ["review"]
+    assert output["status"] == "completed"
+    assert [step["operation"] for step in output["steps"]] == ["create_pending_comment", "complete_pending_review"]
+
+
+def test_cli_combined_review_retains_comment_when_completion_fails():
+    stdout = io.StringIO()
+    transport = ReviewWorkflowTransport(fail_completion=True)
+
+    exit_code = main(
+        [
+            "--project", "ABC", "--repo", "demo", "pr", "review", "42",
+            "--comment", "LGTM", "--needs-work",
+        ],
+        env=ENV,
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    output = json.loads(stdout.getvalue())
+    assert output["status"] == "partial"
+    assert output["steps"][0]["response"]["id"] == 99
+    assert output["steps"][1]["error"]["status"] == 409
+    assert (
+        "btbkt --base-url https://bitbucket.internal --username alice --project ABC --repo demo "
+        "pr review-submit 42 --needs-work"
+    ) in output["recovery"]
+
+
+def test_cli_combined_review_refuses_duplicate_pending_comment():
+    stdout = io.StringIO()
+    transport = ReviewWorkflowTransport(pending={"values": [{"id": 98, "text": "already pending"}]})
+
+    exit_code = main(
+        [
+            "--project", "ABC", "--repo", "demo", "pr", "review", "42",
+            "--comment", "LGTM", "--approve",
+        ],
+        env=ENV,
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert [request[0] for request in transport.requests] == ["GET", "GET"]
+    output = json.loads(stdout.getvalue())
+    assert output["status"] == "blocked"
+    assert output["recovery"] == [
+        "btbkt --base-url https://bitbucket.internal --username alice --project ABC --repo demo "
+        "pr review-pending 42",
+        "btbkt --base-url https://bitbucket.internal --username alice --project ABC --repo demo "
+        "pr review-submit 42 --approve",
+        "btbkt --base-url https://bitbucket.internal --username alice --project ABC --repo demo "
+        "pr review-discard 42",
+    ]
+
+
+def test_cli_combined_review_recovery_commands_include_shell_quoted_explicit_context():
+    stdout = io.StringIO()
+    transport = ReviewWorkflowTransport(pending={"values": [{"id": 98}]})
+
+    exit_code = main(
+        [
+            "--base-url", "https://bitbucket.internal/bitbucket",
+            "--username", "alice ops",
+            "--token", "secret-token",
+            "--project", "ABC TEAM",
+            "--repo", "demo repo",
+            "pr", "review", "42", "--comment", "LGTM", "--unapprove",
+        ],
+        env={},
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert json.loads(stdout.getvalue())["recovery"] == [
+        "btbkt --base-url https://bitbucket.internal/bitbucket --username 'alice ops' "
+        "--project 'ABC TEAM' --repo 'demo repo' pr review-pending 42",
+        "btbkt --base-url https://bitbucket.internal/bitbucket --username 'alice ops' "
+        "--project 'ABC TEAM' --repo 'demo repo' pr review-submit 42 --unapprove",
+        "btbkt --base-url https://bitbucket.internal/bitbucket --username 'alice ops' "
+        "--project 'ABC TEAM' --repo 'demo repo' pr review-discard 42",
+    ]
+    assert "secret-token" not in stdout.getvalue()
+
+
+def test_cli_combined_review_recovery_strips_base_url_userinfo():
+    stdout = io.StringIO()
+    transport = ReviewWorkflowTransport(pending={"values": [{"id": 98}]})
+
+    exit_code = main(
+        ["--project", "ABC", "--repo", "demo", "pr", "review", "42", "--comment", "LGTM", "--approve"],
+        env={
+            "BITBUCKET_BASE_URL": "https://url-user:url-password@bitbucket.internal:8443/bitbucket",
+            "BITBUCKET_USERNAME": "configured-user",
+            "BITBUCKET_TOKEN": "secret-token",
+        },
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    output_text = stdout.getvalue()
+    assert "url-user" not in output_text
+    assert "url-password" not in output_text
+    assert "secret-token" not in output_text
+    output = json.loads(output_text)
+    assert output["recovery"][0].startswith(
+        "btbkt --base-url https://bitbucket.internal:8443/bitbucket "
+        "--username configured-user --project ABC --repo demo pr review-pending 42"
+    )
+
+
+def test_cli_combined_review_partial_error_url_strips_base_url_userinfo():
+    stdout = io.StringIO()
+    transport = ReviewWorkflowTransport(fail_completion=True)
+
+    exit_code = main(
+        ["--project", "ABC", "--repo", "demo", "pr", "review", "42", "--comment", "LGTM", "--approve"],
+        env={
+            "BITBUCKET_BASE_URL": "https://url-user:url-password@bitbucket.internal:8443/bitbucket",
+            "BITBUCKET_USERNAME": "configured-user",
+            "BITBUCKET_TOKEN": "secret-token",
+        },
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    output_text = stdout.getvalue()
+    assert "url-user" not in output_text
+    assert "url-password" not in output_text
+    assert "secret-token" not in output_text
+    output = json.loads(output_text)
+    assert output["steps"][1]["error"]["url"] == (
+        "https://bitbucket.internal:8443/bitbucket/rest/api/1.0/projects/ABC/repos/demo/pull-requests/42/review"
+    )
+
+
+def test_cli_combined_review_partial_error_redacts_known_secrets():
+    class SecretEchoingTransport(ReviewWorkflowTransport):
+        authorization = ""
+
+        def __call__(self, method, url, headers, body):
+            if method == "PUT" and url.endswith("/pull-requests/42/review"):
+                self.authorization = headers["Authorization"]
+                error_body = (
+                    "NoSuchPullRequestReviewException raw-password raw-token "
+                    f"{self.authorization} {url} decoded-user=url-user decoded-password=url-password"
+                )
+                raise BitbucketAPIError(409, url + "?echo=raw-token", error_body)
+            return super().__call__(method, url, headers, body)
+
+    stdout = io.StringIO()
+    transport = SecretEchoingTransport()
+
+    exit_code = main(
+        ["--project", "ABC", "--repo", "demo", "pr", "review", "42", "--comment", "LGTM", "--approve"],
+        env={
+            "BITBUCKET_BASE_URL": "https://url%2Duser:url%2Dpassword@bitbucket.internal/bitbucket",
+            "BITBUCKET_USERNAME": "configured-user",
+            "BITBUCKET_PASSWORD": "raw-password",
+            "BITBUCKET_TOKEN": "raw-token",
+        },
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    output_text = stdout.getvalue()
+    for secret in (
+        "url%2Duser", "url-user", "url%2Dpassword", "url-password",
+        "raw-password", "raw-token", "Basic ",
+    ):
+        assert secret not in output_text
+    assert transport.authorization not in output_text
+    error = json.loads(output_text)["steps"][1]["error"]
+    assert error["status"] == 409
+    assert "NoSuchPullRequestReviewException" in error["message"]
 
 
 def test_cli_create_defaults_source_and_target_from_context():
@@ -464,40 +766,114 @@ def test_cli_create_defaults_source_and_target_from_context():
     assert payload["toRef"]["id"] == "refs/heads/develop"
 
 
-def test_cli_needs_work_maps_to_review_status():
+def test_cli_review_pending_forwards_pagination():
     stdout = io.StringIO()
-    transport = CapturingTransport()
+    transport = ReviewWorkflowTransport()
 
     exit_code = main(
         [
-            "--project",
-            "ABC",
-            "--repo",
-            "demo",
-            "pr",
-            "review",
-            "42",
-            "--comment",
-            "Tests are missing.",
-            "--needs-work",
+            "--project", "ABC", "--repo", "demo", "pr", "review-pending", "42",
+            "--limit", "10", "--start", "20",
         ],
-        env={
-            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
-            "BITBUCKET_USERNAME": "alice",
-            "BITBUCKET_TOKEN": "token",
-        },
+        env=ENV,
         stdout=stdout,
         transport=transport,
     )
 
     assert exit_code == 0
-    method, url, _headers, body = transport.requests[0]
-    assert method == "PUT"
-    assert url.endswith("/pull-requests/42/review")
-    assert json.loads(body.decode("utf-8")) == {
-        "commentText": "Tests are missing.",
+    assert len(transport.requests) == 1
+    assert transport.requests[0][0] == "GET"
+    assert transport.requests[0][1].endswith("/pull-requests/42/review?limit=10&start=20")
+
+
+def test_cli_review_submit_fetches_commit_then_completes_review():
+    stdout = io.StringIO()
+    transport = ReviewWorkflowTransport()
+
+    exit_code = main(
+        ["--project", "ABC", "--repo", "demo", "pr", "review-submit", "42", "--needs-work"],
+        env=ENV,
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert [request[0] for request in transport.requests] == ["GET", "PUT"]
+    assert transport.requests[0][1].endswith("/pull-requests/42")
+    assert transport.requests[1][1].endswith("/pull-requests/42/review")
+    assert json.loads(transport.requests[1][3].decode("utf-8")) == {
         "participantStatus": "NEEDS_WORK",
+        "lastReviewedCommit": "abc123",
     }
+
+
+def test_cli_review_discard_deletes_pending_review():
+    stdout = io.StringIO()
+    transport = ReviewWorkflowTransport()
+
+    exit_code = main(
+        ["--project", "ABC", "--repo", "demo", "pr", "review-discard", "42"],
+        env=ENV,
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert len(transport.requests) == 1
+    assert transport.requests[0][0] == "DELETE"
+    assert transport.requests[0][1].endswith("/pull-requests/42/review")
+    assert transport.requests[0][3] is None
+
+
+def test_cli_review_submit_surfaces_missing_pending_review_error():
+    class MissingReviewTransport(ReviewWorkflowTransport):
+        def __call__(self, method, url, headers, body):
+            if method == "PUT" and url.endswith("/pull-requests/42/review"):
+                raise BitbucketAPIError(404, url, "NoSuchPullRequestReviewException: no pending review")
+            return super().__call__(method, url, headers, body)
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    exit_code = main(
+        ["--project", "ABC", "--repo", "demo", "pr", "review-submit", "42", "--approve"],
+        env=ENV,
+        stdout=stdout,
+        stderr=stderr,
+        transport=MissingReviewTransport(),
+    )
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert "NoSuchPullRequestReviewException" in stderr.getvalue()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pr", "review", "42"],
+        ["pr", "review", "42", "--approve", "--unapprove"],
+        ["pr", "review-submit", "42"],
+        ["pr", "review-submit", "42", "--unapprove", "--needs-work"],
+    ],
+)
+def test_cli_review_commands_require_exactly_one_selected_decision(argv):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        ["--project", "ABC", "--repo", "demo", *argv],
+        env=ENV,
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert transport.requests == []
+    assert json.loads(stderr.getvalue())["error"] == "ValueError"
 
 
 def test_cli_reply_posts_parent_comment_payload():
@@ -703,9 +1079,9 @@ def test_cli_reply_many_stops_on_first_api_error_by_default(tmp_path):
             str(replies_path),
         ],
         env={
-            "BITBUCKET_BASE_URL": "https://bitbucket.internal",
+            "BITBUCKET_BASE_URL": "https://url-user:url-password@bitbucket.internal:8443/bitbucket",
             "BITBUCKET_USERNAME": "alice",
-            "BITBUCKET_TOKEN": "token",
+            "BITBUCKET_TOKEN": "secret-token",
         },
         stdout=stdout,
         stderr=stderr,
@@ -715,12 +1091,59 @@ def test_cli_reply_many_stops_on_first_api_error_by_default(tmp_path):
     assert exit_code == 1
     assert stderr.getvalue() == ""
     assert len(transport.requests) == 1
-    output = json.loads(stdout.getvalue())
+    output_text = stdout.getvalue()
+    assert "url-user" not in output_text
+    assert "url-password" not in output_text
+    assert "secret-token" not in output_text
+    output = json.loads(output_text)
     assert output["attempted"] == 1
     assert output["failed"] == 1
     assert output["results"][0]["comment_id"] == 15466
     assert output["results"][0]["status"] == "error"
     assert output["results"][0]["error"]["status"] == 404
+    assert output["results"][0]["error"]["url"] == (
+        "https://bitbucket.internal:8443/bitbucket/rest/api/1.0/projects/ABC/repos/demo/"
+        "pull-requests/42/comments"
+    )
+
+
+def test_cli_reply_many_error_redacts_known_secrets(tmp_path):
+    class SecretEchoingTransport:
+        authorization = ""
+
+        def __call__(self, method, url, headers, body):
+            self.authorization = headers["Authorization"]
+            error_body = f"missing reply endpoint raw-password raw-token {self.authorization}"
+            raise BitbucketAPIError(404, url + "?echo=raw-token", error_body)
+
+    replies_path = tmp_path / "replies.json"
+    replies_path.write_text(json.dumps([{"comment_id": 15466, "text": "Fails."}]))
+    stdout = io.StringIO()
+    transport = SecretEchoingTransport()
+
+    exit_code = main(
+        [
+            "--project", "ABC", "--repo", "demo", "pr", "reply-many", "42",
+            "--input", str(replies_path),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://url-user:url-password@bitbucket.internal/bitbucket",
+            "BITBUCKET_USERNAME": "configured-user",
+            "BITBUCKET_PASSWORD": "raw-password",
+            "BITBUCKET_TOKEN": "raw-token",
+        },
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    output_text = stdout.getvalue()
+    for secret in ("url-password", "raw-password", "raw-token", "Basic "):
+        assert secret not in output_text
+    assert transport.authorization not in output_text
+    error = json.loads(output_text)["results"][0]["error"]
+    assert error["status"] == 404
+    assert "missing reply endpoint" in error["message"]
 
 
 def test_cli_reply_many_continue_on_error_attempts_remaining_replies(tmp_path):
@@ -1289,6 +1712,222 @@ def test_cli_project_list_does_not_require_project_or_repo_context():
     assert stderr.getvalue() == ""
     assert json.loads(stdout.getvalue())["method"] == "GET"
     assert transport.requests[0][1] == "https://bitbucket.internal/rest/api/1.0/projects?limit=10"
+
+
+def test_cli_raw_get_does_not_require_project_or_repo_context():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        ["raw", "GET", "/rest/api/1.0/projects"],
+        env=ENV,
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    assert transport.requests[0][0] == "GET"
+    assert transport.requests[0][1] == "https://bitbucket.internal/rest/api/1.0/projects"
+    assert transport.requests[0][3] is None
+
+
+def test_cli_api_error_strips_base_url_userinfo():
+    class FailingTransport:
+        def __call__(self, method, url, headers, body):
+            raise BitbucketAPIError(503, url, "service unavailable")
+
+    stderr = io.StringIO()
+
+    exit_code = main(
+        ["raw", "GET", "/rest/api/1.0/projects"],
+        env={
+            "BITBUCKET_BASE_URL": "https://url-user:url-password@bitbucket.internal:8443/bitbucket",
+            "BITBUCKET_USERNAME": "configured-user",
+            "BITBUCKET_TOKEN": "secret-token",
+        },
+        stdout=io.StringIO(),
+        stderr=stderr,
+        transport=FailingTransport(),
+    )
+
+    assert exit_code == 1
+    output_text = stderr.getvalue()
+    assert "url-user" not in output_text
+    assert "url-password" not in output_text
+    assert "secret-token" not in output_text
+    assert json.loads(output_text) == {
+        "error": "BitbucketAPIError",
+        "message": "Bitbucket API request failed with HTTP 503: service unavailable",
+        "status": 503,
+        "url": "https://bitbucket.internal:8443/bitbucket/rest/api/1.0/projects",
+    }
+
+
+def test_cli_api_error_redacts_known_secrets_from_message():
+    class SecretEchoingTransport:
+        authorization = ""
+
+        def __call__(self, method, url, headers, body):
+            self.authorization = headers["Authorization"]
+            error_body = (
+                f"service unavailable raw-password raw-token {self.authorization} {url} "
+                "decoded-user=url-user decoded-password=url-password"
+            )
+            raise BitbucketAPIError(503, url + "?echo=raw-token", error_body)
+
+    stderr = io.StringIO()
+    transport = SecretEchoingTransport()
+
+    exit_code = main(
+        ["raw", "GET", "/rest/api/1.0/projects"],
+        env={
+            "BITBUCKET_BASE_URL": "https://url%2Duser:url%2Dpassword@bitbucket.internal/bitbucket",
+            "BITBUCKET_USERNAME": "configured-user",
+            "BITBUCKET_PASSWORD": "raw-password",
+            "BITBUCKET_TOKEN": "raw-token",
+        },
+        stdout=io.StringIO(),
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    output_text = stderr.getvalue()
+    for secret in (
+        "url%2Duser", "url-user", "url%2Dpassword", "url-password",
+        "raw-password", "raw-token", "Basic ",
+    ):
+        assert secret not in output_text
+    assert transport.authorization not in output_text
+    error = json.loads(output_text)
+    assert error["status"] == 503
+    assert "service unavailable" in error["message"]
+
+
+def test_cli_raw_put_strictly_decodes_json_body():
+    stdout = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        ["raw", "PUT", "/rest/api/1.0/example", "--json", '{"enabled":true,"count":2}'],
+        env=ENV,
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    method, url, headers, body = transport.requests[0]
+    assert method == "PUT"
+    assert url == "https://bitbucket.internal/rest/api/1.0/example"
+    assert headers["Content-Type"] == "application/json"
+    assert json.loads(body.decode("utf-8")) == {"enabled": True, "count": 2}
+
+
+def test_cli_raw_preserves_explicit_json_null_body():
+    stdout = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        ["raw", "PATCH", "/rest/api/1.0/example", "--json", "null"],
+        env=ENV,
+        stdout=stdout,
+        transport=transport,
+    )
+
+    assert exit_code == 0
+    _method, _url, headers, body = transport.requests[0]
+    assert headers["Content-Type"] == "application/json"
+    assert body == b"null"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://attacker.example/rest/api/1.0/projects",
+        "/plugins/servlet/example",
+        "/rest/../plugins/servlet/example",
+        "/rest/%2e%2e/plugins/servlet/example",
+        "/rest/..;/plugins/servlet/example",
+        "/rest/%2e%2e%3b/plugins/servlet/example",
+        "/rest/%252e%252e%253b/plugins/servlet/example",
+    ],
+)
+def test_cli_raw_rejects_targets_outside_rest_without_transport(target):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        ["raw", "GET", target],
+        env=ENV,
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert transport.requests == []
+    error = json.loads(stderr.getvalue())
+    assert error["error"] == "ValueError"
+    assert "/rest/" in error["message"]
+
+
+def test_cli_raw_rejects_malformed_json_without_transport():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        ["raw", "POST", "/rest/api/1.0/example", "--json", '{"broken":'],
+        env=ENV,
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert transport.requests == []
+    error = json.loads(stderr.getvalue())
+    assert error["error"] == "ValueError"
+    assert "valid JSON" in error["message"]
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_cli_raw_rejects_nonstandard_json_constants_without_transport(constant):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    transport = CapturingTransport()
+
+    exit_code = main(
+        ["raw", "POST", "/rest/api/1.0/example", "--json", '{"value":' + constant + "}"],
+        env=ENV,
+        stdout=stdout,
+        stderr=stderr,
+        transport=transport,
+    )
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert transport.requests == []
+    error = json.loads(stderr.getvalue())
+    assert error["error"] == "ValueError"
+    assert constant in error["message"]
+
+
+def test_cli_raw_help_lists_controlled_interface(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["raw", "--help"], env={})
+
+    assert exc_info.value.code == 0
+    help_output = capsys.readouterr().out
+    assert "{GET,POST,PUT,PATCH,DELETE}" in help_output
+    assert "/rest/" in help_output
+    assert "--json" in help_output
 
 
 def test_cli_project_get_uses_cli_project_key():
