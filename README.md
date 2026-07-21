@@ -8,8 +8,9 @@
 `btbkt` is an agent-facing CLI for Bitbucket Data Center / Server.
 
 It is a thin wrapper over Bitbucket's REST API, with a small set of higher-level
-PR commands that return compact JSON for agent workflows: opening PRs, reviewing
-others' PRs, reading review comments, and responding after code changes.
+repository and PR commands that return compact JSON for agent workflows:
+credential-safe clone/fetch/update, opening PRs, reviewing others' PRs, reading
+review comments, and responding after code changes.
 
 ## Install
 
@@ -56,6 +57,12 @@ The CLI always sends HTTP Basic auth using `BITBUCKET_USERNAME` plus
 target branch are not read from env; they come from CLI flags or the current git
 checkout.
 
+Repository commands also use the token/password for HTTP(S) Git authentication.
+`btbkt` creates and cleans up its internal askpass resources; credentials are not
+put in clone URLs, remotes, Git config, or command arguments. SSH clone links use
+the caller's existing SSH agent or key. Plain HTTP is supported for compatibility
+and reported with a warning because credentials are sent without TLS.
+
 ## Skill
 
 Agent workflow guidance lives here:
@@ -79,6 +86,37 @@ a different destination without changing it, run
 `python scripts/sync_skill.py --check --destination PATH`.
 
 ## Examples
+
+Clone a branch without constructing a clone URL or askpass helper:
+
+```bash
+btbkt --project TRAD --repo trading repo clone \
+  --branch master \
+  /home/runner/codebases/bitbucket/TRAD/trading
+```
+
+Idempotently maintain a long-lived checkout. A missing/empty path is cloned; an
+existing matching checkout is fetched and updated only when the current branch
+is clean and can be fast-forwarded:
+
+```bash
+btbkt --project TRAD --repo trading repo ensure \
+  --ref master \
+  /home/runner/codebases/bitbucket/TRAD/trading
+```
+
+Fetch a tag, commit, or PR source without changing an existing worktree:
+
+```bash
+btbkt --project TRAD --repo trading repo fetch --tag v1.2.3 PATH
+btbkt --project TRAD --repo trading repo fetch --commit FULL_COMMIT_SHA PATH
+btbkt --project TRAD --repo trading repo fetch --pr 390 PATH
+```
+
+Without an explicit ref, repository commands use Bitbucket's configured remote
+default branch. Dirty, detached, or different-branch checkouts may fetch but are
+not reset, switched, or overwritten; `repo ensure` reports that case as a
+nonzero partial result with recovery guidance.
 
 Find the PR for the current git branch:
 

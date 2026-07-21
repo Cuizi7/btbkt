@@ -1,6 +1,6 @@
 ---
 name: using-btbkt-pr-workflows
-description: Use when creating, finding, reviewing, repairing, or deciding Bitbucket Data Center pull requests with btbkt, especially when comments, pending reviews, reviewer status, pagination, or mutation recovery affect correctness.
+description: Use when accessing Bitbucket Data Center repositories or creating, finding, reviewing, repairing, or deciding pull requests with btbkt, especially when clone authentication, safe checkout updates, comments, pending reviews, reviewer status, pagination, or mutation recovery affect correctness.
 ---
 
 # Using btbkt PR Workflows
@@ -14,6 +14,7 @@ Use compact read commands to establish state before and after writes. A public c
 - Infer project, repository, and branches from the current git checkout, or put explicit global flags before `pr`: `btbkt --project PROJECT --repo REPO --source-branch BRANCH --target-branch BRANCH pr ...`.
 - If `btbkt` is missing from `PATH` or required `BITBUCKET_*` variables are missing, run `source ~/.zshrc` and retry. Never print credential values loaded from the shell profile.
 - Authentication comes from `BITBUCKET_BASE_URL`, `BITBUCKET_USERNAME`, and `BITBUCKET_TOKEN` or `BITBUCKET_PASSWORD`. Never print tokens, passwords, auth headers, or credentialed remotes.
+- Use `btbkt repo clone`, `repo fetch`, and `repo ensure` for Git access. Do not create your own GIT_ASKPASS, credential script, or credentialed clone URL.
 - Treat `create`, `comment`, `task`, `reply`, `reply-many`, review decisions, pending-review writes, `merge`, `decline`, `reopen`, and non-GET `raw` calls as externally visible mutations. Run them only with user authorization.
 - Treat output as JSON. Inspect branch pair, commits, reviewers, comments, blockers, counts, truncation, and `page` metadata before concluding.
 
@@ -21,6 +22,9 @@ Use compact read commands to establish state before and after writes. A public c
 
 | Need | Use first |
 | --- | --- |
+| Clone a repository/ref | `btbkt --project PROJECT --repo REPO repo clone [--branch BRANCH] PATH` |
+| Fetch without changing the worktree | `btbkt --project PROJECT --repo REPO repo fetch [REF OPTION] PATH` |
+| Maintain a long-lived checkout | `btbkt --project PROJECT --repo REPO repo ensure [REF OPTION] PATH` |
 | Find a PR for the source branch | `btbkt pr current` |
 | Create a PR | `btbkt pr create --title TITLE --description TEXT [--reviewer USER]` |
 | Triage or final-check | `btbkt pr review-summary PR_ID --state OPEN` |
@@ -40,6 +44,32 @@ Use compact read commands to establish state before and after writes. A public c
 `review-context` defaults to a unified diff capped at 200 lines. Focus broad
 reviews with `--path PATH --max-diff-lines N`; use `--diff-format structured`
 only when parsed hunk JSON is required.
+
+## Workflow: Repository Access
+
+Use btbkt instead of constructing Git authentication or clone URLs:
+
+```bash
+btbkt --project PROJECT --repo REPO repo clone --branch BRANCH PATH
+btbkt --project PROJECT --repo REPO repo fetch --tag TAG PATH
+btbkt --project PROJECT --repo REPO repo ensure --ref BRANCH PATH
+```
+
+Choose at most one of `--branch`, `--tag`, `--commit`, `--pr`, or `--ref`.
+Without one, btbkt reads Bitbucket's configured default branch. `repo fetch`
+never changes the worktree. `repo ensure` clones a missing/empty destination or
+fetches an existing expected repository; it updates only a clean checkout already
+on the requested branch, and only by fast-forward. A dirty, detached, different-
+branch, divergent, or locally-ahead checkout is not reset or switched. Inspect a
+nonzero `partial` result and its `state`, `warning`, and `recovery` fields before
+deciding what to do next.
+
+Use a full 40- or 64-character object ID with `--commit`; use `--pr` for pull
+request source refs instead of spelling Bitbucket's internal ref namespace.
+
+HTTP(S) Git uses the existing `BITBUCKET_*` credentials internally. SSH uses the
+caller's SSH agent/key. Do not print or persist credentials when diagnosing a
+failure.
 
 ## Choose The Correct Review Operation
 
@@ -157,3 +187,4 @@ Only `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` are accepted, the path must beg
 - Guessing from a terse comment without nearby diff context.
 - Creating a duplicate PR before running `pr current`.
 - Printing secrets or credentialed remotes.
+- Reimplementing GIT_ASKPASS or clone URL construction instead of using `btbkt repo clone|fetch|ensure`.

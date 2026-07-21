@@ -63,6 +63,21 @@ def test_skill_preserves_reply_404_and_diff_display_guidance():
     assert "--diff-format structured" in skill
 
 
+def test_skill_routes_repository_access_through_btbkt_instead_of_diy_askpass():
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+
+    required_guidance = [
+        "btbkt --project PROJECT --repo REPO repo clone",
+        "btbkt --project PROJECT --repo REPO repo fetch",
+        "btbkt --project PROJECT --repo REPO repo ensure",
+        "dirty",
+        "fast-forward",
+        "Do not create your own GIT_ASKPASS",
+    ]
+    missing = [item for item in required_guidance if item not in skill]
+    assert not missing, f"skill is missing repository access guidance: {missing}"
+
+
 def test_make_compile_includes_scripts():
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
 

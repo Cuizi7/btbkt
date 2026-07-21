@@ -66,6 +66,9 @@ class BitbucketClient:
             self._project_path(self._require_project(project), "repos", self._require_repo(repo)),
         )
 
+    def get_default_branch(self) -> Any:
+        return self._request("GET", self._repo_path("default-branch"))
+
     def list_pull_requests(
         self,
         *,

@@ -110,6 +110,32 @@ def test_list_and_get_repositories_use_project_repo_endpoints():
     assert get_request[1] == "https://bitbucket.internal/rest/api/1.0/projects/ABC/repos/repo%20with%20spaces"
 
 
+def test_get_default_branch_uses_repository_default_branch_endpoint():
+    transport = CapturingTransport()
+    client = BitbucketClient(
+        base_url="https://bitbucket.internal",
+        auth_header=("Authorization", "Basic token"),
+        project="ABC",
+        repo="demo",
+        transport=transport,
+    )
+
+    client.get_default_branch()
+
+    assert transport.requests == [
+        (
+            "GET",
+            "https://bitbucket.internal/rest/api/1.0/projects/ABC/repos/demo/default-branch",
+            {
+                "Authorization": "Basic token",
+                "Accept": "application/json",
+                "User-Agent": "btbkt/0.1",
+            },
+            None,
+        )
+    ]
+
+
 def test_list_comments_can_filter_by_path_and_state():
     transport = CapturingTransport()
     client = BitbucketClient(

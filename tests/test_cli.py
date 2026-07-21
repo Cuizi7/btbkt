@@ -4,7 +4,8 @@ import json
 import pytest
 
 from btbkt.client import BitbucketAPIError
-from btbkt.cli import main
+from btbkt.cli import build_parser, main
+from btbkt.repo_access import GitOperationError
 
 
 class CapturingTransport:
@@ -14,6 +15,64 @@ class CapturingTransport:
     def __call__(self, method, url, headers, body):
         self.requests.append((method, url, headers, body))
         return {"url": url, "method": method}
+
+
+class RepositoryAccessTransport:
+    def __init__(self):
+        self.requests = []
+
+    def __call__(self, method, url, headers, body):
+        self.requests.append((method, url, headers, body))
+        if url.endswith("/default-branch"):
+            return {"id": "refs/heads/master", "displayId": "master"}
+        if url.endswith("/repos/trading"):
+            return {
+                "links": {
+                    "clone": [
+                        {
+                            "name": "http",
+                            "href": "https://bitbucket.example/scm/TRAD/trading.git",
+                        }
+                    ]
+                }
+            }
+        raise AssertionError(f"Unexpected request: {method} {url}")
+
+
+class RepositoryAccessGitRunner:
+    def __init__(self, *, dirty=False, failure=None):
+        self.dirty = dirty
+        self.failure = failure
+        self.remote_commit = "a" * 40
+        self.calls = []
+
+    def run(self, args, *, cwd=None, auth=None, acceptable_returncodes=(0,), safe_url=None):
+        import subprocess
+
+        args = list(args)
+        self.calls.append((args, cwd, auth))
+        if self.failure and args[0] == "fetch":
+            raise self.failure
+        stdout = ""
+        if args[:3] == ["rev-parse", "--is-inside-work-tree"]:
+            stdout = "true\n"
+        elif args[:2] == ["rev-parse", "--show-toplevel"]:
+            stdout = str(cwd) + "\n"
+        elif args[:4] == ["remote", "get-url", "--all", "origin"]:
+            stdout = "https://bitbucket.example/scm/TRAD/trading.git\n"
+        elif args[0] == "check-ref-format":
+            pass
+        elif args[0] == "fetch":
+            pass
+        elif args[:2] == ["rev-parse", "--verify"]:
+            stdout = self.remote_commit + "\n"
+        elif args[:3] == ["symbolic-ref", "--quiet", "--short"]:
+            stdout = "master\n"
+        elif args[:2] == ["status", "--porcelain"]:
+            stdout = " M local.txt\n" if self.dirty else ""
+        else:
+            raise AssertionError(f"Unexpected Git command: {args}")
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
 
 
 PULL_REQUEST = {
@@ -2002,3 +2061,158 @@ def test_cli_empty_env_does_not_fall_back_to_process_environment(monkeypatch):
     error = json.loads(stderr.getvalue())
     assert error["error"] == "configuration_error"
     assert "BITBUCKET_BASE_URL" in error["message"]
+
+
+def test_repo_access_ref_options_are_mutually_exclusive(tmp_path):
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--project", "TRAD", "--repo", "trading", "repo", "ensure",
+                "--branch", "master", "--tag", "v1", str(tmp_path / "checkout"),
+            ]
+        )
+
+
+def test_cli_repo_ensure_returns_stable_agent_json(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    exit_code = main(
+        [
+            "--project", "TRAD", "--repo", "trading", "repo", "ensure",
+            "--branch", "master", str(checkout),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.example",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": "cli-token",
+        },
+        stdout=stdout,
+        stderr=stderr,
+        transport=RepositoryAccessTransport(),
+        git_runner=RepositoryAccessGitRunner(),
+        cwd=tmp_path,
+    )
+
+    assert exit_code == 0
+    assert stderr.getvalue() == ""
+    payload = json.loads(stdout.getvalue())
+    assert payload == {
+        "status": "ok",
+        "action": "unchanged",
+        "project": "TRAD",
+        "repo": "trading",
+        "path": str(checkout),
+        "requested_ref": "master",
+        "ref_kind": "branch",
+        "resolved_commit": "a" * 40,
+        "changed": False,
+        "warning": None,
+        "state": {
+            "branch": "master",
+            "head": "a" * 40,
+            "dirty": False,
+            "detached": False,
+        },
+    }
+
+
+def test_cli_repo_ensure_returns_nonzero_partial_after_successful_fetch(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    stdout = io.StringIO()
+
+    exit_code = main(
+        [
+            "--project", "TRAD", "--repo", "trading", "repo", "ensure",
+            "--branch", "master", str(checkout),
+        ],
+        env=ENV,
+        stdout=stdout,
+        stderr=io.StringIO(),
+        transport=RepositoryAccessTransport(),
+        git_runner=RepositoryAccessGitRunner(dirty=True),
+        cwd=tmp_path,
+    )
+
+    assert exit_code == 1
+    payload = json.loads(stdout.getvalue())
+    assert payload["status"] == "partial"
+    assert payload["action"] == "fetched"
+    assert "dirty" in payload["warning"]
+    assert payload["recovery"]
+
+
+def test_cli_repo_success_payload_recursively_redacts_known_secret(tmp_path):
+    secret = "result-secret"
+    checkout = tmp_path / secret
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    stdout = io.StringIO()
+
+    exit_code = main(
+        [
+            "--project", "TRAD", "--repo", "trading", "repo", "fetch",
+            "--branch", secret, str(checkout),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.example",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": secret,
+        },
+        stdout=stdout,
+        stderr=io.StringIO(),
+        transport=RepositoryAccessTransport(),
+        git_runner=RepositoryAccessGitRunner(),
+        cwd=tmp_path,
+    )
+
+    assert exit_code == 0
+    assert secret not in stdout.getvalue()
+    payload = json.loads(stdout.getvalue())
+    assert payload["requested_ref"] == "[REDACTED]"
+    assert "[REDACTED]" in payload["path"]
+
+
+def test_cli_repo_git_failure_is_redacted_and_has_recovery_state(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    secret = "cli-failure-token"
+    stderr = io.StringIO()
+    failure = GitOperationError(
+        f"Git authentication failed with {secret}",
+        state={"branch": f"master-{secret}", "dirty": False},
+        recovery=(f"Check {secret} repository access and retry.",),
+    )
+
+    exit_code = main(
+        [
+            "--project", "TRAD", "--repo", "trading", "repo", "fetch",
+            "--branch", "master", str(checkout),
+        ],
+        env={
+            "BITBUCKET_BASE_URL": "https://bitbucket.example",
+            "BITBUCKET_USERNAME": "alice",
+            "BITBUCKET_TOKEN": secret,
+        },
+        stdout=io.StringIO(),
+        stderr=stderr,
+        transport=RepositoryAccessTransport(),
+        git_runner=RepositoryAccessGitRunner(failure=failure),
+        cwd=tmp_path,
+    )
+
+    assert exit_code == 1
+    assert secret not in stderr.getvalue()
+    payload = json.loads(stderr.getvalue())
+    assert payload["error"] == "git_operation_error"
+    assert payload["state"]["branch"] == "master-[REDACTED]"
+    assert payload["state"]["dirty"] is False
+    assert payload["recovery"] == ["Check [REDACTED] repository access and retry."]

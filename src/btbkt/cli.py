@@ -20,6 +20,7 @@ from .compact import (
     compact_review_summary,
 )
 from .context import ConfigError, read_git_info, resolve_context
+from .repo_access import GitAuth, GitOperationError, GitRunner, RefRequest, RepositoryAccess
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ def main(
     stdout: Optional[TextIO] = None,
     stderr: Optional[TextIO] = None,
     transport: Optional[Transport] = None,
+    git_runner: Optional[GitRunner] = None,
     cwd: Optional[Union[str, Path]] = None,
 ) -> int:
     stdout = sys.stdout if stdout is None else stdout
@@ -73,7 +75,14 @@ def main(
             repo=context.repo,
             transport=transport,
         )
-        result = _dispatch(args, context, client, error_redactions)
+        result = _dispatch(
+            args,
+            context,
+            client,
+            error_redactions,
+            git_runner=git_runner,
+            git_secret=_git_secret(args, effective_env),
+        )
         exit_code = 0
         if isinstance(result, CommandResult):
             exit_code = result.exit_code
@@ -89,8 +98,19 @@ def main(
             payload["url"] = _redact_text(_strip_url_userinfo(exc.url), error_redactions)
         _write_json(stderr, payload)
         return 1
+    except GitOperationError as exc:
+        payload = {
+            "error": "git_operation_error",
+            "message": _redact_text(str(exc), error_redactions),
+        }
+        if exc.state:
+            payload["state"] = exc.state
+        if exc.recovery:
+            payload["recovery"] = exc.recovery
+        _write_json(stderr, _redact_value(payload, error_redactions))
+        return 1
 
-    _write_json(stdout, result)
+    _write_json(stdout, _redact_value(result, error_redactions))
     return exit_code
 
 
@@ -131,6 +151,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     repo_get = repo_actions.add_parser("get", help="Get one repository.")
     repo_get.add_argument("repo_slug", nargs="?")
+
+    for action, help_text in (
+        ("clone", "Clone a repository with btbkt-managed authentication."),
+        ("fetch", "Fetch one repository ref without changing the worktree."),
+        ("ensure", "Clone or safely fast-forward an existing repository checkout."),
+    ):
+        access_parser = repo_actions.add_parser(action, help=help_text)
+        ref_group = access_parser.add_mutually_exclusive_group()
+        ref_group.add_argument("--branch", help="Fetch a branch by name.")
+        ref_group.add_argument("--tag", help="Fetch a tag by name.")
+        ref_group.add_argument("--commit", help="Fetch a full 40- or 64-character hexadecimal commit ID.")
+        ref_group.add_argument("--pr", type=int, help="Fetch the source commit of a pull request.")
+        ref_group.add_argument("--ref", help="Fetch a branch/tag ref, full commit ID, or unambiguous name.")
+        access_parser.add_argument("path", type=Path, help="Destination or existing checkout path.")
 
     pr = resources.add_parser("pr", help="Pull request workflows.")
     pr_actions = pr.add_subparsers(dest="action", required=True)
@@ -313,11 +347,20 @@ def _dispatch(
     context,
     client: BitbucketClient,
     error_redactions: Sequence[str],
+    *,
+    git_runner: Optional[GitRunner],
+    git_secret: str,
 ) -> Any:
     if args.resource == "project":
         return _dispatch_project(args, client)
     if args.resource == "repo":
-        return _dispatch_repo(args, client)
+        return _dispatch_repo(
+            args,
+            context,
+            client,
+            git_runner=git_runner,
+            git_secret=git_secret,
+        )
     if args.resource == "pr":
         return _dispatch_pr(args, context, client, error_redactions)
     if args.resource == "raw":
@@ -352,12 +395,40 @@ def _dispatch_project(args: argparse.Namespace, client: BitbucketClient) -> Any:
     raise ValueError(f"Unsupported project action: {args.action}")
 
 
-def _dispatch_repo(args: argparse.Namespace, client: BitbucketClient) -> Any:
+def _dispatch_repo(
+    args: argparse.Namespace,
+    context,
+    client: BitbucketClient,
+    *,
+    git_runner: Optional[GitRunner],
+    git_secret: str,
+) -> Any:
     if args.action == "list":
         return client.list_repositories(project=args.project_key, limit=args.limit, start=args.start)
     if args.action == "get":
         return client.get_repository(repo=args.repo_slug)
+    if args.action in {"clone", "fetch", "ensure"}:
+        if not context.username or not git_secret:
+            raise ConfigError("Missing Bitbucket Git credentials.")
+        access = RepositoryAccess(
+            client=client,
+            project=context.project,
+            repo=context.repo,
+            auth=GitAuth(username=context.username, secret=git_secret),
+            runner=git_runner,
+        )
+        request = _repository_ref_request(args)
+        result = getattr(access, args.action)(args.path, request)
+        return CommandResult(payload=result.to_dict(), exit_code=result.exit_code)
     raise ValueError(f"Unsupported repo action: {args.action}")
+
+
+def _repository_ref_request(args: argparse.Namespace) -> Optional[RefRequest]:
+    for kind in ("branch", "tag", "commit", "pr", "ref"):
+        value = getattr(args, kind, None)
+        if value is not None:
+            return RefRequest(kind, str(value))
+    return None
 
 
 def _dispatch_pr(
@@ -660,10 +731,31 @@ def _error_redaction_values(args, env: Mapping[str, str], context) -> tuple[str,
     return tuple(sorted({value for value in candidates if value}, key=len, reverse=True))
 
 
+def _git_secret(args, env: Mapping[str, str]) -> str:
+    password = args.password or env.get("BITBUCKET_PASSWORD")
+    token = args.token or env.get("BITBUCKET_TOKEN")
+    return password or token or ""
+
+
 def _redact_text(text: str, redactions: Sequence[str]) -> str:
     for value in redactions:
         text = text.replace(value, "[REDACTED]")
     return text
+
+
+def _redact_value(value: Any, redactions: Sequence[str]) -> Any:
+    if isinstance(value, str):
+        return _redact_text(value, redactions)
+    if isinstance(value, list):
+        return [_redact_value(item, redactions) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_value(item, redactions) for item in value]
+    if isinstance(value, Mapping):
+        return {
+            _redact_text(str(key), redactions): _redact_value(item, redactions)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _reject_json_constant(value: str) -> None:
